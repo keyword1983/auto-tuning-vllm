@@ -16,7 +16,7 @@ optimization:
   preset: "high_throughput"
   sampler: "botorch"
   n_trials: 200
-  max_concurrent: 2
+  max_concurrent_trials: 2
 
 benchmark:
   # Constants

@@ -69,7 +69,8 @@ def test_backend_interface():
     try:
         # Create trial config
         trial_config = TrialConfig(
-            study_id=1,
+            study_name="test_study",
+            trial_id="trial_1",
             trial_number=1,
             parameters={"max_num_batched_tokens": 8192},
             benchmark_config=BenchmarkConfig()
