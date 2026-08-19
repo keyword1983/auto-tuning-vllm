@@ -18,6 +18,7 @@ from ..core.storage.postgres_utils import clear_study_data, verify_database_conn
 from ..core.study_controller import StudyController
 from ..execution.backends import RayExecutionBackend
 from ..logging.manager import CentralizedLogger, LogStreamer
+from .agent_cmd import agent_command
 
 # Setup rich console and app
 console = Console()
@@ -26,6 +27,10 @@ app = typer.Typer(
     help="Distributed hyperparameter optimization for vLLM serving",
     add_completion=False,
 )
+app.command(
+    "agent",
+    help="Run the Claude-driven pod-per-experiment vLLM tuner",
+)(agent_command)
 
 # Setup logger for CLI
 logger = logging.getLogger(__name__)
@@ -1364,6 +1369,7 @@ def main():
         console.print("\nUse --help for available commands")
         console.print("\nQuick start:")
         console.print("  auto-tune-vllm optimize --config study.yaml")
+        console.print("  auto-tune-vllm agent --vllm-endpoint http://localhost:8000")
         console.print(
             "  auto-tune-vllm logs --study-name my_study --database-url postgresql://..."
         )

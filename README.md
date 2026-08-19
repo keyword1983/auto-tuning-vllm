@@ -11,6 +11,7 @@ A distributed hyperparameter optimization framework for vLLM serving, built with
 - 🚀 **Distributed Optimization**: Scale across multiple GPUs and nodes using Ray
 - 🎯 **Flexible Backends**: Run locally or on Ray clusters  
 - 📊 **Rich Benchmarking**: Built-in GuideLLM support + custom benchmark providers
+- 🤖 **Agentic Tuner**: Claude-driven pod-per-experiment search (optional `[agent]` extra)
 - 🗄️ **Centralized Storage**: PostgreSQL for trials, metrics, and logs
 - ⚙️ **Easy Configuration**: YAML-based study and parameter configuration
 - 📈 **Multi-Objective**: Support for throughput vs latency trade-offs
@@ -39,13 +40,22 @@ auto-tune-vllm logs --study-id 42 --trial-number 15
 
 # Resume interrupted study
 auto-tune-vllm resume --study-name study_35884
+
+# Claude-driven tuner (keeps the baseline pod read-only)
+pip install -e ".[agent]"
+auto-tune-vllm agent \
+    --vllm-endpoint http://localhost:8000 \
+    --model facebook/opt-125m \
+    --oc-mode --oc-pod <baseline-pod> --oc-namespace <ns> \
+    --pod-template examples/agent/experiment-pod.yaml
 ```
 
 
 ## Documentation
 
 - [Ray Cluster Setup](docs/ray_cluster_setup.md) - **Important for distributed optimization**
-- [Configuration Reference](docs/configuration.md) 
+- [Configuration Reference](docs/configuration.md)
+- [Agentic Tuner](docs/agentic_tuning.md) - Claude-driven pod-per-experiment alternative to Optuna 
 
 ## Requirements
 

@@ -51,6 +51,14 @@ viz = [
     "plotly>=5.0.0",
     "pandas>=2.0.0",
 ]
+# Claude-driven agentic tuner (pod-per-experiment)
+agent = [
+    "anthropic[vertex]>=0.40.0",
+    "paramiko>=3.0",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "guidellm>=0.1.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/openshift-psap/auto-tuning-vllm"
@@ -72,6 +80,9 @@ target-version = "py310"
 select = ["E", "F", "I"]
 ignore = []
 
+[tool.ruff.lint.per-file-ignores]
+"auto_tune_vllm/agent/**" = ["E501"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
@@ -81,3 +92,7 @@ pythonVersion = "3.10"
 typeCheckingMode = "recommended"
 reportUnusedVariable = true
 reportUnusedImport = true
+exclude = [
+    "**/__pycache__",
+    "auto_tune_vllm/agent",
+]

@@ -1,0 +1,57 @@
+# Template pod for agentic pod-per-experiment tuning.
+# The baseline pod is never modified. Each experiment clones this template,
+# appends extra vLLM CLI args, benchmarks it, then deletes it.
+#
+# Usage:
+#   auto-tune-vllm agent \
+#     --vllm-endpoint http://localhost:8000 \
+#     --model facebook/opt-125m \
+#     --oc-mode --oc-pod <baseline-pod> --oc-namespace <ns> \
+#     --pod-template examples/agent/experiment-pod.yaml
+#
+# Edit image, model path, PVC, and GPU count for your cluster before running.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-tune-experiment
+  labels:
+    app: auto-tune-vllm
+    vllm-experiment: "true"
+spec:
+  containers:
+    - name: vllm
+      image: vllm/vllm-openai:v0.11.0
+      args:
+        - --model
+        - /models/facebook/opt-125m
+        - --port
+        - "8000"
+        - --dtype
+        - auto
+      env:
+        - name: HF_HOME
+          value: /tmp/hf-cache
+      ports:
+        - containerPort: 8000
+          name: http
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+          nvidia.com/gpu: "1"
+        limits:
+          nvidia.com/gpu: "1"
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 30
+        periodSeconds: 5
+      volumeMounts:
+        - name: model-storage
+          mountPath: /models
+  volumes:
+    - name: model-storage
+      persistentVolumeClaim:
+        claimName: model-pvc
+  restartPolicy: Never
