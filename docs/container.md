@@ -265,8 +265,25 @@ Hugging Face repo ID.
 ## Verified
 
 Built and pushed to a registry, deployed as a pod on a real GPU node, and run
-end-to-end with `facebook/opt-125m` through the `vllmbench` provider -
-produced a real `output_tokens_per_second` objective value. See commit
-history for the two bugs this surfaced and fixed along the way
-(`_validate_environment()` unconditionally requiring `guidellm`, and an
-indentation bug in `patch_transformers.py`).
+end-to-end through the `vllmbench` provider - including a full 30-trial
+env-var-driven optimization run (`TUNE_WORKLOAD=chat`, `TUNE_RATE=10`,
+searching `gpu_memory_utilization`/`max_num_batched_tokens`/`max_num_seqs`
+against `facebook/opt-125m`) that found a real improvement over the vLLM-
+defaults baseline:
+
+```
+Best Value      5811.31 tok/s   (baseline: 5597.19 tok/s, +3.8%)
+Best Trial      #23 of 30
+gpu_memory_utilization  0.912
+max_num_batched_tokens  5120
+max_num_seqs            24
+```
+
+Along the way this surfaced and fixed three real bugs (see commit history):
+`_validate_environment()` unconditionally requiring `guidellm` regardless of
+the configured provider, an indentation bug in `patch_transformers.py` that
+crashed transformers' import for every model, and `optuna-integration`'s
+`BoTorchSampler` failing against the image's intentionally-old pinned
+`botorch` (hence `tpe` as the default sampler above). It also surfaced the
+`kubectl exec`/`cp`-vs-ephemeral-filesystem problem that motivated
+`TUNE_DATABASE_URL`.

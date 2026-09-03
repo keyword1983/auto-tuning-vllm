@@ -41,10 +41,18 @@ spec:
               value: "0.85-0.95:0.01"           # "min-max:step"
             - name: TUNE_MAX_NUM_BATCHED_TOKENS
               value: "2048-32768:2048"
+            - name: TUNE_MAX_NUM_SEQS
+              value: "8-32:8"
             - name: TUNE_KV_CACHE_DTYPE
               value: "auto,fp8"                 # comma-separated options
             - name: TUNE_TENSOR_PARALLEL_SIZE
               value: "1"                        # static, not searched
+            # Without this, results only exist inside the pod's ephemeral
+            # filesystem and are unrecoverable once the pod exits (see
+            # docs/container.md#tune_database_url). Point at a Postgres
+            # instance for anything you don't want to risk losing.
+            # - name: TUNE_DATABASE_URL
+            #   value: "postgresql://user:pass@postgres:5432/auto_tune_vllm"
           resources:
             limits: { nvidia.com/gpu: 1 }
             requests: { nvidia.com/gpu: 1 }
