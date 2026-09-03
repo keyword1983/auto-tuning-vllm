@@ -28,7 +28,6 @@ dependencies = [
     "optuna-integration[botorch]>=4.0.0",
     "ray[default]>=2.0.0",
     "vllm>=0.11.0",
-    "guidellm>=0.1.0",
     "pyyaml>=6.0",
     "pydantic>=2.0.0",
     "typer>=0.9.0",
@@ -40,6 +39,15 @@ dependencies = [
 [project.optional-dependencies]
 postgresql = [
     "psycopg2-binary>=2.9.0",
+]
+# The default benchmark provider is "vllmbench" (vllm's own `vllm bench
+# serve` CLI, already included via the vllm dependency above). guidellm is
+# only needed for benchmark_type: "guidellm" and is pinned loosely here
+# because its CLI has changed shape across releases - check
+# `guidellm benchmark --help` against auto_tune_vllm/benchmarks/providers.py
+# before upgrading it.
+guidellm = [
+    "guidellm>=0.1.0",
 ]
 dev = [
     "pytest>=7.0.0",

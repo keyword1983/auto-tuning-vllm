@@ -1,0 +1,49 @@
+# Example study configuration using the "vllmbench" benchmark provider
+# (vllm's built-in `vllm bench serve` CLI) instead of GuideLLM.
+#
+# Note: vllm bench serve is bound by --num-prompts, not by wall-clock time,
+# so `max_seconds` below is ignored by this provider. Use `samples` to size
+# the run, and `rate` to set the max concurrent in-flight requests
+# (mapped to --max-concurrency).
+study:
+  name: "local_vllmbench_test"
+
+optimization:
+  preset: "high_throughput"
+  sampler: "botorch"
+  n_trials: 200
+  max_concurrent: 2
+
+benchmark:
+  benchmark_type: "vllmbench"
+  model: "RedHatAI/Qwen3-30B-A3B-FP8-dynamic"
+  dataset: null  # Use synthetic (random) data
+  prompt_tokens: 10000
+  output_tokens: 1000
+  rate: 10          # --max-concurrency
+  samples: 200      # --num-prompts
+
+logging:
+  file_path: "/tmp/auto-tune-vllm-local-run/logs"
+  log_level: "INFO"
+
+parameters:
+  max_num_batched_tokens:
+    enabled: true
+    min: 1024
+    max: 32768
+    step: 1024
+
+  gpu_memory_utilization:
+    enabled: true
+    min: 0.9
+    max: 0.95
+    step: 0.01
+
+  kv_cache_dtype:
+    enabled: true
+    options: ["fp8"]
+
+static_environment_variables:
+  VLLM_USE_V1: "1"
+  VLLM_STARTUP_TIMEOUT: "900"

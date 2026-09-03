@@ -512,6 +512,10 @@ class CustomBenchmarkTemplate(BenchmarkProvider):
 
 
 # Registry for dynamic benchmark provider loading (for reference/documentation)
+# Note: "vllmbench" (auto_tune_vllm.benchmarks.custom.vllmbench.VllmbenchBenchmark)
+# is intentionally not listed here - it's loaded dynamically by
+# TrialController._import_custom_benchmark() like any other custom provider,
+# and importing it here would create a providers -> custom -> providers cycle.
 BENCHMARK_PROVIDERS = {
     "guidellm": GuideLLMBenchmark,
     "custom_template": CustomBenchmarkTemplate,
