@@ -45,7 +45,8 @@ auto-tune-vllm resume --study-name study_35884
 ## Documentation
 
 - [Ray Cluster Setup](docs/ray_cluster_setup.md) - **Important for distributed optimization**
-- [Configuration Reference](docs/configuration.md) 
+- [Configuration Reference](docs/configuration.md)
+- [Container Image](docs/container.md) - Building and running as a Docker image
 
 ## Requirements
 
