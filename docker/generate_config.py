@@ -25,6 +25,16 @@ def _num(token):
     return float(token) if "." in token else int(token)
 
 
+def resolve_rate():
+    """"inf" (default, case-insensitive) stays a string sentinel meaning
+    "no --max-concurrency cap"; anything else must be a real concurrency
+    count."""
+    raw = env("TUNE_RATE", "inf")
+    if str(raw).strip().lower() == "inf":
+        return "inf"
+    return int(raw)
+
+
 def parse_range(spec):
     """"0.85-0.95" -> {min, max}; "2048-32768:2048" -> {min, max, step}."""
     if ":" in spec:
@@ -76,9 +86,13 @@ DEFAULT_PARAMETERS = {
 # fixed prompt_tokens - it's derived from TUNE_MAX_MODEL_LEN so the prompt
 # actually fills the model's context window instead of an arbitrary number.
 WORKLOAD_PROFILES = {
-    "short": {"prompt_tokens": 100, "output_tokens": 100},
-    "chat": {"prompt_tokens": 200, "output_tokens": 250},
-    "long": {"output_tokens": 2000},  # prompt_tokens = max_model_len - output_tokens
+    "short": {"prompt_tokens": 100, "output_tokens": 100, "samples": 128},
+    "chat": {"prompt_tokens": 200, "output_tokens": 250, "samples": 128},
+    # prompt_tokens = max_model_len - output_tokens. Each request is far
+    # more expensive (long prefill/decode) than short/chat, so far fewer
+    # samples both keeps a run affordable and is what --num-prompts=128
+    # would take way too long to complete anyway.
+    "long": {"output_tokens": 2000, "samples": 5},
 }
 
 
@@ -131,6 +145,21 @@ def resolve_prompt_output_tokens():
     )
 
 
+def resolve_samples():
+    """TUNE_SAMPLES wins if set; otherwise derive from TUNE_WORKLOAD's
+    profile (validated already by resolve_prompt_output_tokens); otherwise
+    100."""
+    samples = env("TUNE_SAMPLES")
+    if samples is not None:
+        return int(samples)
+
+    workload = env("TUNE_WORKLOAD")
+    if workload in WORKLOAD_PROFILES and "samples" in WORKLOAD_PROFILES[workload]:
+        return WORKLOAD_PROFILES[workload]["samples"]
+
+    return 100
+
+
 def build_config():
     model = env("TUNE_MODEL")
     if not model:
@@ -138,6 +167,8 @@ def build_config():
         sys.exit(1)
 
     prompt_tokens, output_tokens = resolve_prompt_output_tokens()
+    rate = resolve_rate()
+    samples = resolve_samples()
 
     config = {
         "study": {},
@@ -158,14 +189,17 @@ def build_config():
             "dataset": None,
             "prompt_tokens": prompt_tokens,
             "output_tokens": output_tokens,
-            # Defaults to 1 (--max-concurrency) so a first, unconfigured
-            # run stays cheap - baseline trials run at this concurrency
-            # before any optimization trial does, so a high default here
-            # means every run starts with a heavy load test whether the
-            # caller wanted one or not. Raise it once you actually want a
-            # throughput/concurrency stress test.
-            "rate": int(env("TUNE_RATE", 1)),
-            "samples": int(env("TUNE_SAMPLES", 100)),
+            # "inf" (default) omits --max-concurrency entirely - no
+            # client-side concurrency cap, so vLLM's own scheduler (bounded
+            # by whatever gpu_memory_utilization/max_num_seqs/
+            # max_num_batched_tokens this trial is testing) decides how
+            # much it actually batches. That means the default already
+            # reflects each candidate configuration's real capacity instead
+            # of an arbitrary fixed ceiling. Set a real number here only to
+            # deliberately simulate a hard concurrency cap (e.g. a load
+            # balancer enforcing one upstream).
+            "rate": resolve_rate(),
+            "samples": samples,
             # Open-loop arrival rate (requests/sec), or "inf" (vLLM's own
             # default) to submit everything at time 0. "rate" above still
             # caps concurrent in-flight requests on top of this - raise it
@@ -178,6 +212,15 @@ def build_config():
             "log_level": env("TUNE_LOG_LEVEL", "INFO"),
         },
         "parameters": {},
+        # Explicit on purpose: left unset, this defaults to [benchmark.rate]
+        # (auto_tune_vllm/core/config.py) - an implicit tie between "how the
+        # baseline reference is measured" and "how optimization trials are
+        # measured" that's surprising even when rate is a normal number, and
+        # breaks outright when rate is "inf" (str "inf" > 256 raises
+        # TypeError in the library's baseline setup). A plain numeric probe
+        # here is decoupled from whatever TUNE_RATE/TUNE_REQUEST_RATE do for
+        # the actual optimization trials.
+        "baseline": {"concurrency_levels": [rate if isinstance(rate, int) else 1]},
     }
 
     study_name = env("TUNE_STUDY_NAME")

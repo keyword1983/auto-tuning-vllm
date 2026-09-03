@@ -27,14 +27,17 @@ spec:
               value: "50"
             - name: TUNE_WORKLOAD
               value: "chat"                      # short | chat | long - see docs/container.md
-            # TUNE_RATE defaults to 1 (cheap, but concurrency-dependent
-            # parameters like max_num_batched_tokens won't show a difference
-            # at concurrency 1). Set this to your actual expected concurrent
-            # request count for a meaningful optimization result.
+            # TUNE_RATE defaults to "inf" (no --max-concurrency cap - vLLM's
+            # own scheduler decides how much to batch based on whatever
+            # gpu_memory_utilization/max_num_seqs this trial is testing).
+            # Set a real number here only to deliberately simulate a hard
+            # concurrency ceiling (e.g. a load balancer enforcing one).
             - name: TUNE_RATE
               value: "10"                       # --max-concurrency for the benchmark
-            - name: TUNE_SAMPLES
-              value: "100"                      # --num-prompts per trial
+            # TUNE_WORKLOAD=chat already sets samples=128 - only override
+            # if you want a different sample count than the profile's.
+            # - name: TUNE_SAMPLES
+            #   value: "100"                     # --num-prompts per trial
             # Only parameters you set below get added to the search space -
             # everything else uses vLLM's own defaults.
             - name: TUNE_GPU_MEMORY_UTILIZATION

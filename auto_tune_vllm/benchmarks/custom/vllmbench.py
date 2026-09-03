@@ -14,14 +14,18 @@ Key semantic differences from GuideLLMBenchmark, verified against
   `--max-seconds` equivalent, so `BenchmarkConfig.max_seconds` is ignored
   here. Use `BenchmarkConfig.samples` (--num-prompts) to size the run.
 - GuideLLM's `--rate-type concurrent --rate N` is a closed-loop concurrency
-  gate, so `BenchmarkConfig.rate` is mapped to `--max-concurrency`.
+  gate, so `BenchmarkConfig.rate` is mapped to `--max-concurrency` - except
+  when `rate` is the string `"inf"`, in which case the flag is omitted
+  entirely (vLLM's own default) so vLLM's own scheduler decides how much
+  to batch, unconstrained by an arbitrary client-side ceiling.
   `BenchmarkConfig.request_rate` maps separately to `--request-rate` (the
-  open-loop arrival rate, in requests/sec) and defaults to `"inf"` -
+  open-loop arrival rate, in requests/sec) and also defaults to `"inf"` -
   vLLM's own default, meaning every request is submitted at time 0. Note
-  that `--max-concurrency` still caps concurrent in-flight requests on top
-  of whatever `--request-rate` is doing - if you set `request_rate` to a
-  real arrival rate to test open-loop behavior, make sure `rate` isn't
-  left low enough to clip it back into an artificial closed-loop test.
+  that `--max-concurrency`, when set to a real number, still caps
+  concurrent in-flight requests on top of whatever `--request-rate` is
+  doing - if you set `request_rate` to a real arrival rate to test
+  open-loop behavior, make sure `rate` isn't left low enough to clip it
+  back into an artificial closed-loop test.
 - Throughput metrics (`request_throughput` / `output_throughput`) are single
   aggregate numbers with no percentile breakdown, unlike GuideLLM's output.
   The same value is reported for every percentile key so objective lookups
@@ -163,8 +167,6 @@ class VllmbenchBenchmark(BenchmarkProvider):
             config.model,
             "--num-prompts",
             str(config.samples),
-            "--max-concurrency",
-            str(config.rate),
             "--request-rate",
             str(config.request_rate),
             "--save-result",
@@ -177,6 +179,16 @@ class VllmbenchBenchmark(BenchmarkProvider):
             "--metric-percentiles",
             ",".join(_PERCENTILES),
         ]
+
+        # "inf" means no client-side concurrency cap - vLLM's own scheduler
+        # (bounded by whatever gpu_memory_utilization/max_num_seqs/
+        # max_num_batched_tokens this trial is testing) decides how much it
+        # actually batches, instead of an arbitrary client-side ceiling.
+        # vllm bench serve's own default for --max-concurrency is "no cap"
+        # (the flag is simply omitted), so we mirror that instead of passing
+        # a literal "inf" the CLI wouldn't accept as a concurrency count.
+        if str(config.rate).strip().lower() != "inf":
+            cmd.extend(["--max-concurrency", str(config.rate)])
 
         if config.processor:
             cmd.extend(["--tokenizer", config.processor])
