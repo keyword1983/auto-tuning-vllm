@@ -71,6 +71,65 @@ DEFAULT_PARAMETERS = {
     "kv_cache_dtype": {"enabled": True, "options": ["auto", "fp8"]},
 }
 
+# Named workload shapes for TUNE_WORKLOAD, so a study can be pointed at a
+# traffic shape by name instead of hand-picking token counts. "long" has no
+# fixed prompt_tokens - it's derived from TUNE_MAX_MODEL_LEN so the prompt
+# actually fills the model's context window instead of an arbitrary number.
+WORKLOAD_PROFILES = {
+    "short": {"prompt_tokens": 100, "output_tokens": 100},
+    "chat": {"prompt_tokens": 200, "output_tokens": 250},
+    "long": {"output_tokens": 2000},  # prompt_tokens = max_model_len - output_tokens
+}
+
+
+def resolve_prompt_output_tokens():
+    """TUNE_PROMPT_TOKENS/TUNE_OUTPUT_TOKENS win if set; otherwise derive
+    from TUNE_WORKLOAD; otherwise fall back to the 1000/1000 default."""
+    workload = env("TUNE_WORKLOAD")
+    prompt_tokens = env("TUNE_PROMPT_TOKENS")
+    output_tokens = env("TUNE_OUTPUT_TOKENS")
+
+    if workload:
+        if workload not in WORKLOAD_PROFILES:
+            print(
+                f"Unknown TUNE_WORKLOAD '{workload}'. Valid options: "
+                f"{', '.join(WORKLOAD_PROFILES)}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        profile = WORKLOAD_PROFILES[workload]
+
+        if output_tokens is None:
+            output_tokens = profile.get("output_tokens", 1000)
+
+        if prompt_tokens is None:
+            if "prompt_tokens" in profile:
+                prompt_tokens = profile["prompt_tokens"]
+            else:
+                max_model_len = env("TUNE_MAX_MODEL_LEN")
+                if not max_model_len:
+                    print(
+                        f"TUNE_WORKLOAD={workload} derives prompt_tokens from "
+                        f"TUNE_MAX_MODEL_LEN - {output_tokens} (to fill the "
+                        f"model's context window) - set TUNE_MAX_MODEL_LEN, "
+                        f"or set TUNE_PROMPT_TOKENS explicitly instead.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                prompt_tokens = int(max_model_len) - int(output_tokens)
+                if prompt_tokens <= 0:
+                    print(
+                        f"TUNE_MAX_MODEL_LEN ({max_model_len}) is too small for "
+                        f"the '{workload}' workload's output_tokens ({output_tokens}).",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+
+    return (
+        int(prompt_tokens) if prompt_tokens is not None else 1000,
+        int(output_tokens) if output_tokens is not None else 1000,
+    )
+
 
 def build_config():
     model = env("TUNE_MODEL")
@@ -78,11 +137,18 @@ def build_config():
         print("TUNE_MODEL is required (HF repo id or local model path)", file=sys.stderr)
         sys.exit(1)
 
+    prompt_tokens, output_tokens = resolve_prompt_output_tokens()
+
     config = {
         "study": {},
         "optimization": {
             "preset": env("TUNE_PRESET", "high_throughput"),
-            "sampler": env("TUNE_SAMPLER", "botorch"),
+            # "tpe" has no extra dependency and is the documented
+            # general-purpose default; "botorch" needs a botorch build new
+            # enough for optuna-integration's BoTorchSampler, which isn't
+            # guaranteed given this image intentionally keeps torch pinned
+            # to whatever vllm/vllm-openai shipped with.
+            "sampler": env("TUNE_SAMPLER", "tpe"),
             "n_trials": int(env("TUNE_N_TRIALS", 50)),
             "max_concurrent_trials": int(env("TUNE_MAX_CONCURRENT_TRIALS", 1)),
         },
@@ -90,9 +156,15 @@ def build_config():
             "benchmark_type": "vllmbench",
             "model": model,
             "dataset": None,
-            "prompt_tokens": int(env("TUNE_PROMPT_TOKENS", 1000)),
-            "output_tokens": int(env("TUNE_OUTPUT_TOKENS", 1000)),
-            "rate": int(env("TUNE_RATE", 30)),
+            "prompt_tokens": prompt_tokens,
+            "output_tokens": output_tokens,
+            # Defaults to 1 (--max-concurrency) so a first, unconfigured
+            # run stays cheap - baseline trials run at this concurrency
+            # before any optimization trial does, so a high default here
+            # means every run starts with a heavy load test whether the
+            # caller wanted one or not. Raise it once you actually want a
+            # throughput/concurrency stress test.
+            "rate": int(env("TUNE_RATE", 1)),
             "samples": int(env("TUNE_SAMPLES", 100)),
         },
         "logging": {
@@ -106,7 +178,17 @@ def build_config():
     if study_name:
         config["study"]["name"] = study_name
     else:
-        config["study"]["prefix"] = env("TUNE_STUDY_PREFIX", "auto_tune")
+        workload = env("TUNE_WORKLOAD")
+        default_prefix = f"auto_tune_{workload}" if workload else "auto_tune"
+        config["study"]["prefix"] = env("TUNE_STUDY_PREFIX", default_prefix)
+
+    # n_startup_trials must be < n_trials (the sampler needs at least one
+    # non-random trial) - only set it if the caller asked for it, so small
+    # smoke-test runs (n_trials < the library default of 10) don't fail
+    # validation just because we always emitted a value here.
+    n_startup_trials = env("TUNE_N_STARTUP_TRIALS")
+    if n_startup_trials:
+        config["optimization"]["n_startup_trials"] = int(n_startup_trials)
 
     for env_name, param_name in RANGE_PARAMS.items():
         value = env(env_name)

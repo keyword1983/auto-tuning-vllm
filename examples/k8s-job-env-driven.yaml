@@ -25,8 +25,14 @@ spec:
               value: "high_throughput"          # high_throughput | low_latency | balanced
             - name: TUNE_N_TRIALS
               value: "50"
+            - name: TUNE_WORKLOAD
+              value: "chat"                      # short | chat | long - see docs/container.md
+            # TUNE_RATE defaults to 1 (cheap, but concurrency-dependent
+            # parameters like max_num_batched_tokens won't show a difference
+            # at concurrency 1). Set this to your actual expected concurrent
+            # request count for a meaningful optimization result.
             - name: TUNE_RATE
-              value: "30"                       # --max-concurrency for the benchmark
+              value: "10"                       # --max-concurrency for the benchmark
             - name: TUNE_SAMPLES
               value: "100"                      # --num-prompts per trial
             # Only parameters you set below get added to the search space -
