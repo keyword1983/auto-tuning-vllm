@@ -100,9 +100,42 @@ same image.
 | `TUNE_PROMPT_TOKENS` / `TUNE_OUTPUT_TOKENS` | `benchmark.prompt_tokens` / `output_tokens` - overrides `TUNE_WORKLOAD` if both are set | `1000` / `1000` |
 | `TUNE_STUDY_NAME` / `TUNE_STUDY_PREFIX` | `study.name` / `study.prefix` | auto-generated prefix `auto_tune` (or `auto_tune_<workload>` if `TUNE_WORKLOAD` is set) |
 | `TUNE_LOG_PATH` / `TUNE_LOG_LEVEL` | `logging.file_path` / `log_level` | `/tmp/auto-tune-vllm-local-run/logs` / `INFO` |
+| `TUNE_DATABASE_URL` | `study.database_url` **and** `logging.database_url` | unset (SQLite + local log files) |
 | `TUNE_TENSOR_PARALLEL_SIZE` / `TUNE_MAX_MODEL_LEN` | `static_parameters.*` | unset (vLLM default) |
 | `TUNE_BACKEND` / `TUNE_PYTHON_EXECUTABLE` | `optimize` CLI flags | `ray` / `/usr/bin/python3` |
 | `TUNE_CONFIG_OUTPUT` | where the rendered YAML is written | `/tmp/generated_study_config.yaml` |
+
+### `TUNE_DATABASE_URL`: making results survive the pod
+
+Without this, trial results (Optuna study: parameters, objective values)
+live in a local SQLite file and logs live under `TUNE_LOG_PATH` - both
+inside the container's ephemeral filesystem. `kubectl exec`/`kubectl cp`
+only work against a *running* container, and this entrypoint `exec`s
+straight into `auto-tune-vllm optimize`, so the moment the run finishes (or
+the pod is deleted, evicted, or crashes) that process exits and there is no
+way to retrieve anything left behind - `kubectl logs` still works (pod
+stdout is retained separately by the kubelet), but the study database and
+log files are gone.
+
+Set `TUNE_DATABASE_URL` to a PostgreSQL connection string
+(`postgresql://user:pass@host:5432/dbname`) and both the Optuna study and
+the trial logger write there in real time instead - safe against the pod
+disappearing at any point, and queryable while the run is still in
+progress. `--create-db` is passed automatically (idempotent - it only
+creates the database if it doesn't already exist) so a fresh database name
+doesn't need to be provisioned by hand first.
+
+```bash
+docker run --rm --gpus all \
+  -e TUNE_MODEL="facebook/opt-125m" \
+  -e TUNE_DATABASE_URL="postgresql://user:pass@postgres.example.com:5432/auto_tune_vllm" \
+  auto-tune-vllm:v0.27.1
+```
+
+If you don't set this, treat the run as disposable: only pull results out
+(`kubectl cp` the SQLite file and log directory) *before* the run finishes,
+not after - or better, mount a PersistentVolume at the study/log paths
+instead of relying on `kubectl cp` timing at all.
 
 ### `TUNE_WORKLOAD`: named traffic shapes
 

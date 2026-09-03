@@ -20,10 +20,19 @@ else
 
     auto-tune-vllm validate --config "$CONFIG_PATH"
 
+    CREATE_DB_FLAG=()
+    if [ -n "${TUNE_DATABASE_URL:-}" ]; then
+        # Idempotent: checks whether the database already exists before
+        # creating it, so this is safe to always pass once a database URL
+        # is configured.
+        CREATE_DB_FLAG=(--create-db)
+    fi
+
     exec auto-tune-vllm optimize \
         --config "$CONFIG_PATH" \
         --backend "${TUNE_BACKEND:-ray}" \
         --start-ray-head \
         --python-executable "${TUNE_PYTHON_EXECUTABLE:-/usr/bin/python3}" \
-        --max-concurrent-trials "${TUNE_MAX_CONCURRENT_TRIALS:-1}"
+        --max-concurrent-trials "${TUNE_MAX_CONCURRENT_TRIALS:-1}" \
+        "${CREATE_DB_FLAG[@]}"
 fi

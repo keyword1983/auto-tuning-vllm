@@ -182,6 +182,17 @@ def build_config():
         default_prefix = f"auto_tune_{workload}" if workload else "auto_tune"
         config["study"]["prefix"] = env("TUNE_STUDY_PREFIX", default_prefix)
 
+    # Without this, trial results and logs only exist inside the
+    # container's ephemeral filesystem - gone the moment the pod finishes
+    # and its process exits (kubectl exec/cp only work against a running
+    # container, so there's no grabbing them afterward). Point both the
+    # Optuna study and the trial logger at the same Postgres instance so
+    # results survive the pod regardless of how/when it exits.
+    database_url = env("TUNE_DATABASE_URL")
+    if database_url:
+        config["study"]["database_url"] = database_url
+        config["logging"]["database_url"] = database_url
+
     # n_startup_trials must be < n_trials (the sampler needs at least one
     # non-random trial) - only set it if the caller asked for it, so small
     # smoke-test runs (n_trials < the library default of 10) don't fail
