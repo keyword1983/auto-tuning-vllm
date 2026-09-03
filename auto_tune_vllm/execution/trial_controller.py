@@ -87,10 +87,21 @@ class BaseTrialController(TrialController):
 
         required_packages = {
             "vllm": "vLLM serving framework",
-            "guidellm": "GuideLLM benchmarking tool",
             "optuna": "Optuna optimization framework",
             "ray": "Ray distributed computing",
         }
+
+        benchmark_type = (
+            trial_config.benchmark_config.benchmark_type
+            if trial_config
+            else "vllmbench"
+        )
+
+        # guidellm is an optional provider (benchmark_type: "guidellm") - the
+        # default "vllmbench" provider only needs the vllm package/CLI, which
+        # is already required above/below.
+        if benchmark_type == "guidellm":
+            required_packages["guidellm"] = "GuideLLM benchmarking tool"
 
         # Only require psycopg2 if using PostgreSQL
         using_postgresql = False
@@ -122,8 +133,10 @@ class BaseTrialController(TrialController):
         # Check if commands are available in PATH
         required_commands = {
             "python3": "Python interpreter",
-            "guidellm": "GuideLLM CLI tool",
+            "vllm": "vLLM CLI (used by the vllmbench benchmark provider)",
         }
+        if benchmark_type == "guidellm":
+            required_commands["guidellm"] = "GuideLLM CLI tool"
 
         import shutil
 
