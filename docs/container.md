@@ -56,6 +56,84 @@ To use a different vLLM release, override the base image tag:
 docker build --build-arg VLLM_IMAGE_TAG=v0.28.0 -t auto-tune-vllm:v0.28.0 .
 ```
 
+## Quick start: env-var-driven config (no YAML required)
+
+Hand-writing a study config YAML is overkill if you just want to tune the
+handful of parameters that actually matter for your model. The image's
+entrypoint (`docker/entrypoint.sh`) has a second mode: run it with **no
+arguments** and set `TUNE_MODEL` (plus whichever `TUNE_*` variables you
+care about), and it renders a full study config
+(`docker/generate_config.py`), validates it, and runs it - no config file
+to write or mount.
+
+```bash
+docker run --rm --gpus all \
+  -e TUNE_MODEL="facebook/opt-125m" \
+  -e TUNE_PRESET="high_throughput" \
+  -e TUNE_N_TRIALS="50" \
+  -e TUNE_GPU_MEMORY_UTILIZATION="0.85-0.95:0.01" \
+  -e TUNE_MAX_NUM_BATCHED_TOKENS="2048-32768:2048" \
+  -e TUNE_KV_CACHE_DTYPE="auto,fp8" \
+  -e TUNE_TENSOR_PARALLEL_SIZE="1" \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  auto-tune-vllm:v0.27.1
+```
+
+Running the image with **no arguments and no `TUNE_MODEL`** prints
+`auto-tune-vllm --help` instead of erroring - and passing explicit
+arguments (as in [Running locally](#running-locally) below) always
+passes through to the CLI unchanged, so both usage styles work with the
+same image.
+
+### `TUNE_*` variables
+
+| Variable | Maps to | Default |
+|---|---|---|
+| `TUNE_MODEL` | `benchmark.model` | **required** |
+| `TUNE_PRESET` | `optimization.preset` | `high_throughput` |
+| `TUNE_SAMPLER` | `optimization.sampler` | `botorch` |
+| `TUNE_N_TRIALS` | `optimization.n_trials` | `50` |
+| `TUNE_MAX_CONCURRENT_TRIALS` | `optimization.max_concurrent_trials` and `--max-concurrent-trials` | `1` |
+| `TUNE_RATE` | `benchmark.rate` (`--max-concurrency`) | `30` |
+| `TUNE_SAMPLES` | `benchmark.samples` (`--num-prompts`) | `100` |
+| `TUNE_PROMPT_TOKENS` / `TUNE_OUTPUT_TOKENS` | `benchmark.prompt_tokens` / `output_tokens` | `1000` / `1000` |
+| `TUNE_STUDY_NAME` / `TUNE_STUDY_PREFIX` | `study.name` / `study.prefix` | auto-generated prefix `auto_tune` |
+| `TUNE_LOG_PATH` / `TUNE_LOG_LEVEL` | `logging.file_path` / `log_level` | `/tmp/auto-tune-vllm-local-run/logs` / `INFO` |
+| `TUNE_TENSOR_PARALLEL_SIZE` / `TUNE_MAX_MODEL_LEN` | `static_parameters.*` | unset (vLLM default) |
+| `TUNE_BACKEND` / `TUNE_PYTHON_EXECUTABLE` | `optimize` CLI flags | `ray` / `/usr/bin/python3` |
+| `TUNE_CONFIG_OUTPUT` | where the rendered YAML is written | `/tmp/generated_study_config.yaml` |
+
+Per-parameter tunables are opt-in: a parameter is only added to the search
+space if you set its variable, so unset ones use vLLM's own defaults -
+same as leaving them out of a hand-written config.
+
+**Range parameters** (`"min-max"` or `"min-max:step"`):
+
+| Variable | Parameter |
+|---|---|
+| `TUNE_GPU_MEMORY_UTILIZATION` | `gpu_memory_utilization` |
+| `TUNE_MAX_NUM_BATCHED_TOKENS` | `max_num_batched_tokens` |
+| `TUNE_MAX_NUM_SEQS` | `max_num_seqs` |
+| `TUNE_CUDA_GRAPH_SIZES` | `cuda_graph_sizes` |
+| `TUNE_MAX_SEQ_LEN_TO_CAPTURE` | `max_seq_len_to_capture` |
+
+**List parameters** (comma-separated, e.g. `"auto,fp8"`):
+
+| Variable | Parameter |
+|---|---|
+| `TUNE_KV_CACHE_DTYPE` | `kv_cache_dtype` |
+| `TUNE_BLOCK_SIZE` | `block_size` |
+
+If you don't set *any* `TUNE_*` parameter variable, `generate_config.py`
+falls back to a small default search space (`gpu_memory_utilization`,
+`max_num_batched_tokens`, `kv_cache_dtype`) so you still get a useful run.
+
+Need a parameter that isn't in this list, or a multi-objective/custom
+`objectives` setup? Fall back to a hand-written config and the normal CLI
+passthrough mode below - see the [Configuration Reference](configuration.md)
+for the full schema. A ready-to-adapt Kubernetes `Job` using this quick
+start is in [`examples/k8s-job-env-driven.yaml`](../examples/k8s-job-env-driven.yaml).
+
 ## Running locally
 
 ```bash

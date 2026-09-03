@@ -9,6 +9,13 @@
 # `python3 -m vllm.entrypoints.openai.api_server` (see
 # auto_tune_vllm/execution/trial_controller.py), not through this image's
 # default entrypoint, so overriding ENTRYPOINT/CMD below is safe.
+#
+# ENTRYPOINT is docker/entrypoint.sh, which has two modes: with no
+# arguments and TUNE_MODEL set, it renders a study config from TUNE_*
+# environment variables (docker/generate_config.py) and runs it - the
+# convenient path for `docker run`/Kubernetes users who don't want to hand
+# -write a study config YAML. Any explicit arguments passthrough straight
+# to the `auto-tune-vllm` CLI, unchanged (see docs/container.md).
 ARG VLLM_IMAGE_TAG=v0.27.1
 FROM docker.io/vllm/vllm-openai:${VLLM_IMAGE_TAG}
 
@@ -38,8 +45,10 @@ RUN pip install --no-cache-dir --no-deps -e /opt/auto-tune-vllm
 # (see patch_transformers.py for details). Safe to no-op if already patched.
 RUN python3 patch_transformers.py
 
+RUN chmod +x docker/entrypoint.sh
+
 ENV VLLM_NO_USAGE_STATS=1 \
     VLLM_DO_NOT_TRACK=1
 
-ENTRYPOINT ["auto-tune-vllm"]
-CMD ["--help"]
+ENTRYPOINT ["/opt/auto-tune-vllm/docker/entrypoint.sh"]
+CMD []

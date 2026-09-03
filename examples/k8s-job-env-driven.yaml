@@ -1,0 +1,49 @@
+# Env-var-driven quick start: set a handful of TUNE_* variables and the
+# container generates + validates + runs the study config itself. See
+# docs/container.md for the full list of TUNE_* variables and defaults.
+#
+# Adjust runtimeClassName/tolerations/nodeSelector for your own cluster's
+# GPU scheduling setup - these vary a lot between clusters and aren't
+# portable defaults.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: auto-tune-vllm
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      # runtimeClassName: nvidia
+      containers:
+        - name: auto-tune-vllm
+          image: keyword1983/auto-tune-vllm:v0.27.1
+          env:
+            - name: TUNE_MODEL
+              value: "facebook/opt-125m"       # required: HF repo id or local model path
+            - name: TUNE_PRESET
+              value: "high_throughput"          # high_throughput | low_latency | balanced
+            - name: TUNE_N_TRIALS
+              value: "50"
+            - name: TUNE_RATE
+              value: "30"                       # --max-concurrency for the benchmark
+            - name: TUNE_SAMPLES
+              value: "100"                      # --num-prompts per trial
+            # Only parameters you set below get added to the search space -
+            # everything else uses vLLM's own defaults.
+            - name: TUNE_GPU_MEMORY_UTILIZATION
+              value: "0.85-0.95:0.01"           # "min-max:step"
+            - name: TUNE_MAX_NUM_BATCHED_TOKENS
+              value: "2048-32768:2048"
+            - name: TUNE_KV_CACHE_DTYPE
+              value: "auto,fp8"                 # comma-separated options
+            - name: TUNE_TENSOR_PARALLEL_SIZE
+              value: "1"                        # static, not searched
+          resources:
+            limits: { nvidia.com/gpu: 1 }
+            requests: { nvidia.com/gpu: 1 }
+          volumeMounts:
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 4Gi }

@@ -198,7 +198,7 @@ The `benchmark` section controls how performance measurements are conducted. Thi
 ### Core Benchmark Settings
 
 #### `benchmark_type` (string, optional)
-The benchmarking framework to use. Currently only "guidellm" is supported. Defaults to "guidellm".
+The benchmarking framework to use. Defaults to `"vllmbench"` (vLLM's own `vllm bench serve` - no extra dependency needed). `"guidellm"` is also available as an optional provider (`pip install auto-tune-vllm[guidellm]`). See [Container Image](container.md) for the semantic differences between the two.
 
 #### `model` (string, required)
 The HuggingFace model identifier to benchmark. This should match the model you plan to serve in production. Examples:
