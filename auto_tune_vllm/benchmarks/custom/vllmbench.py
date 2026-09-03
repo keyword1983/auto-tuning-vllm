@@ -14,9 +14,14 @@ Key semantic differences from GuideLLMBenchmark, verified against
   `--max-seconds` equivalent, so `BenchmarkConfig.max_seconds` is ignored
   here. Use `BenchmarkConfig.samples` (--num-prompts) to size the run.
 - GuideLLM's `--rate-type concurrent --rate N` is a closed-loop concurrency
-  gate, so `BenchmarkConfig.rate` is mapped to `--max-concurrency`
-  (not `--request-rate`, which is an open-loop arrival rate and defaults to
-  submitting everything immediately).
+  gate, so `BenchmarkConfig.rate` is mapped to `--max-concurrency`.
+  `BenchmarkConfig.request_rate` maps separately to `--request-rate` (the
+  open-loop arrival rate, in requests/sec) and defaults to `"inf"` -
+  vLLM's own default, meaning every request is submitted at time 0. Note
+  that `--max-concurrency` still caps concurrent in-flight requests on top
+  of whatever `--request-rate` is doing - if you set `request_rate` to a
+  real arrival rate to test open-loop behavior, make sure `rate` isn't
+  left low enough to clip it back into an artificial closed-loop test.
 - Throughput metrics (`request_throughput` / `output_throughput`) are single
   aggregate numbers with no percentile breakdown, unlike GuideLLM's output.
   The same value is reported for every percentile key so objective lookups
@@ -160,6 +165,8 @@ class VllmbenchBenchmark(BenchmarkProvider):
             str(config.samples),
             "--max-concurrency",
             str(config.rate),
+            "--request-rate",
+            str(config.request_rate),
             "--save-result",
             "--result-dir",
             str(results_path.parent),

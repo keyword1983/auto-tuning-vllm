@@ -166,6 +166,12 @@ def build_config():
             # throughput/concurrency stress test.
             "rate": int(env("TUNE_RATE", 1)),
             "samples": int(env("TUNE_SAMPLES", 100)),
+            # Open-loop arrival rate (requests/sec), or "inf" (vLLM's own
+            # default) to submit everything at time 0. "rate" above still
+            # caps concurrent in-flight requests on top of this - raise it
+            # if you set a real TUNE_REQUEST_RATE, or it'll clip the
+            # arrival pattern back into a closed-loop test.
+            "request_rate": env("TUNE_REQUEST_RATE", "inf"),
         },
         "logging": {
             "file_path": env("TUNE_LOG_PATH", "/tmp/auto-tune-vllm-local-run/logs"),

@@ -94,7 +94,8 @@ same image.
 | `TUNE_SAMPLER` | `optimization.sampler` | `tpe` |
 | `TUNE_N_TRIALS` | `optimization.n_trials` | `50` |
 | `TUNE_MAX_CONCURRENT_TRIALS` | `optimization.max_concurrent_trials` and `--max-concurrent-trials` | `1` |
-| `TUNE_RATE` | `benchmark.rate` (`--max-concurrency`) | `1` (baseline trials run at this concurrency too - raise it deliberately, not by accident) |
+| `TUNE_RATE` | `benchmark.rate` (`--max-concurrency`, closed-loop cap) | `1` (baseline trials run at this concurrency too - raise it deliberately, not by accident) |
+| `TUNE_REQUEST_RATE` | `benchmark.request_rate` (`--request-rate`, open-loop arrival rate, req/s) | `"inf"` (vLLM's own default - submit everything at time 0) |
 | `TUNE_SAMPLES` | `benchmark.samples` (`--num-prompts`) | `100` |
 | `TUNE_WORKLOAD` | selects a named traffic shape (below) - sets `prompt_tokens`/`output_tokens` for you | unset |
 | `TUNE_PROMPT_TOKENS` / `TUNE_OUTPUT_TOKENS` | `benchmark.prompt_tokens` / `output_tokens` - overrides `TUNE_WORKLOAD` if both are set | `1000` / `1000` |
@@ -104,6 +105,42 @@ same image.
 | `TUNE_TENSOR_PARALLEL_SIZE` / `TUNE_MAX_MODEL_LEN` | `static_parameters.*` | unset (vLLM default) |
 | `TUNE_BACKEND` / `TUNE_PYTHON_EXECUTABLE` | `optimize` CLI flags | `ray` / `/usr/bin/python3` |
 | `TUNE_CONFIG_OUTPUT` | where the rendered YAML is written | `/tmp/generated_study_config.yaml` |
+
+### `TUNE_RATE` vs `TUNE_REQUEST_RATE`: closed-loop vs open-loop load
+
+These control two different things and can fight each other if set
+carelessly:
+
+- **`TUNE_RATE`** (`--max-concurrency`): a hard cap on concurrent in-flight
+  requests. Closed-loop - the benchmark client won't submit request N+1
+  until one of the current N finishes.
+- **`TUNE_REQUEST_RATE`** (`--request-rate`): requests/sec at which new
+  requests *arrive*, independent of whether earlier ones finished yet.
+  Open-loop - defaults to `"inf"` (everything arrives at time 0).
+
+Picking a benchmark concurrency isn't just about avoiding "too low to see
+any batching effect" - it's also easy to end up testing a number with no
+real reference point. Finding your server's own saturation point (e.g. by
+sweeping `baseline.concurrency_levels`) sounds like a way to pick one, but
+it's circular: the very parameters you're searching (`max_num_seqs`,
+`max_num_batched_tokens`, ...) change where that saturation point is, so a
+"peak" measured against vLLM's defaults doesn't mean much once you start
+testing other parameter combinations.
+
+The way out is to anchor on something that *doesn't* depend on the
+parameters under test: your actual (or target) production arrival rate.
+That's what `TUNE_REQUEST_RATE` is for - set it to requests/sec matching
+your real traffic, leave `TUNE_RATE` high enough that it doesn't clip the
+arrival pattern back into an artificial closed-loop cap, and let each
+parameter combination's queueing/latency behavior emerge naturally. A
+config that handles your real arrival rate with low queueing is
+genuinely better than one that doesn't - that comparison isn't circular,
+because the arrival rate itself never changes between trials.
+
+If you don't know your production arrival rate, `TUNE_RATE` alone
+(closed-loop, `TUNE_REQUEST_RATE` left at `"inf"`) is a reasonable
+fallback - just don't mistake "high concurrency" for "correct answer";
+it's a *deliberately chosen* stress level, not a discovered one.
 
 ### `TUNE_DATABASE_URL`: making results survive the pod
 

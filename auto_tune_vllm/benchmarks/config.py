@@ -20,6 +20,13 @@ class BenchmarkConfig:
     processor: Optional[str] = None  # Processor model, defaults to model if not set
     rate: int = 50  # Single rate value for concurrent requests
     samples: int = 1000  # Number of samples to take
+
+    # vllmbench only: open-loop request arrival rate (--request-rate),
+    # requests/sec, or "inf" to send everything at time 0 (vLLM's own
+    # default). Closed-loop concurrency (`rate` above, --max-concurrency)
+    # still applies as a cap on top of this - set `rate` high enough that
+    # it doesn't clip the arrival pattern you're actually trying to test.
+    request_rate: str = "inf"
     
     # Token statistics for synthetic data - only used when explicitly specified
     prompt_tokens_stdev: Optional[int] = None
