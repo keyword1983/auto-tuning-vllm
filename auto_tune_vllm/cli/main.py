@@ -6,7 +6,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-import ray
+try:
+    import ray
+except ImportError:
+    ray = None
 import typer
 from rich.console import Console
 from rich.logging import RichHandler

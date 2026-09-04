@@ -11,8 +11,15 @@ from abc import ABC, abstractmethod
 from enum import Enum, auto
 from typing import Optional
 
-import ray
-from ray.exceptions import GetTimeoutError
+try:
+    import ray
+    from ray.exceptions import GetTimeoutError
+    HAS_RAY = True
+except ImportError:
+    ray = None
+    class GetTimeoutError(Exception):
+        pass
+    HAS_RAY = False
 
 from ..benchmarks.providers import BenchmarkProvider, GuideLLMBenchmark
 from ..core.trial import ExecutionInfo, TrialConfig, TrialResult
@@ -1380,16 +1387,21 @@ class RayWorkerTrialController(BaseTrialController):
 
 
 # Ray remote actor wrapper
-@ray.remote
-class RayTrialActor(RayWorkerTrialController):
-    """Ray remote actor for distributed trial execution."""
+if HAS_RAY:
+    @ray.remote
+    class RayTrialActor(RayWorkerTrialController):
+        """Ray remote actor for distributed trial execution."""
 
-    def run_trial(
-        self, trial_config: TrialConfig, cancellation_flag_actor=None
-    ) -> TrialResult:
-        """Run trial on Ray worker with optional cancellation flag actor."""
-        return super().run_trial(trial_config, cancellation_flag_actor)
+        def run_trial(
+            self, trial_config: TrialConfig, cancellation_flag_actor=None
+        ) -> TrialResult:
+            """Run trial on Ray worker with optional cancellation flag actor."""
+            return super().run_trial(trial_config, cancellation_flag_actor)
 
-    def __del__(self):
-        """Ensure cleanup on actor destruction."""
-        self.cleanup_resources()
+        def __del__(self):
+            """Ensure cleanup on actor destruction."""
+            self.cleanup_resources()
+else:
+    class RayTrialActor(RayWorkerTrialController):
+        """Fallback when Ray is not installed."""
+        pass

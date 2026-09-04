@@ -13,7 +13,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import ray
+try:
+    import ray
+    HAS_RAY = True
+except ImportError:
+    ray = None
+    HAS_RAY = False
 
 from ..core.trial import TrialConfig, TrialResult
 
@@ -25,23 +30,36 @@ except ImportError:
     AFSBoxK8sBackend = None
 
 
-# Simple Ray actor to hold cancellation state that can be modified externally
+# Cancellation flag (Ray actor if Ray available, standard object otherwise)
+if HAS_RAY:
+    @ray.remote
+    class CancellationFlag:
+        """Lightweight Ray actor to hold mutable cancellation state."""
 
-@ray.remote
-class CancellationFlag:
-    """Lightweight Ray actor to hold mutable cancellation state."""
+        def __init__(self):
+            self.cancelled = False
 
-    def __init__(self):
-        self.cancelled = False
+        def request_cancellation(self):
+            """Set cancellation flag to True."""
+            self.cancelled = True
+            return True
 
-    def request_cancellation(self):
-        """Set cancellation flag to True."""
-        self.cancelled = True
-        return True
+        def is_cancelled(self):
+            """Check if cancellation was requested."""
+            return self.cancelled
+else:
+    class CancellationFlag:
+        """Fallback cancellation flag when Ray is not installed."""
 
-    def is_cancelled(self):
-        """Check if cancellation was requested."""
-        return self.cancelled
+        def __init__(self):
+            self.cancelled = False
+
+        def request_cancellation(self):
+            self.cancelled = True
+            return True
+
+        def is_cancelled(self):
+            return self.cancelled
 
 @dataclass
 class JobHandle:
@@ -100,6 +118,11 @@ class RayExecutionBackend(ExecutionBackend):
         venv_path: Optional[str] = None,
         conda_env: Optional[str] = None,
     ):
+        if not HAS_RAY:
+            raise ImportError(
+                "Ray is not installed in this environment. "
+                "Please install ray or use --backend afsbox."
+            )
         # Legacy: resource_requirements per backend (now calculated per trial)
         self.resource_requirements = resource_requirements or {
             "num_gpus": 1,
