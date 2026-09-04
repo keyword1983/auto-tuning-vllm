@@ -116,7 +116,18 @@ def optimize_command(
         "ray",
         "--backend",
         "-b",
-        help="Execution backend: 'ray' (only supported option)",
+        help="Execution backend: 'ray' or 'afsbox'",
+    ),
+    tuning_name: Optional[str] = typer.Option(
+        None,
+        "--tuning-name",
+        help="AFSBox ModelTuning CR name (for --backend afsbox)",
+    ),
+    namespace: str = typer.Option(
+        "default",
+        "--namespace",
+        "-n",
+        help="Kubernetes namespace (for --backend afsbox)",
     ),
     n_trials: Optional[int] = typer.Option(
         None, "--trials", "-n", help="Number of trials (overrides config)"
@@ -150,27 +161,28 @@ def optimize_command(
     """Run optimization study."""
     setup_logging(verbose)
 
-    # Validate Python environment options (exactly one should be specified)
-    python_env_options = [python_executable, venv_path, conda_env]
-    specified_options = [opt for opt in python_env_options if opt is not None]
+    if backend.lower() != "afsbox":
+        # Validate Python environment options (exactly one should be specified for Ray)
+        python_env_options = [python_executable, venv_path, conda_env]
+        specified_options = [opt for opt in python_env_options if opt is not None]
 
-    if len(specified_options) == 0:
-        console.print(
-            "[bold red]"
-            "Error: At least one Python environment option must be specified"
-            "[/bold red]"
-        )
-        console.print("Choose one of: --python-executable, --venv-path, or --conda-env")
-        raise typer.Exit(1)
+        if len(specified_options) == 0:
+            console.print(
+                "[bold red]"
+                "Error: At least one Python environment option must be specified"
+                "[/bold red]"
+            )
+            console.print("Choose one of: --python-executable, --venv-path, or --conda-env")
+            raise typer.Exit(1)
 
-    if len(specified_options) > 1:
-        console.print(
-            "[bold red]"
-            "Error: Only one Python environment option can be specified at a time"
-            "[/bold red]"
-        )
-        console.print("Choose one of: --python-executable, --venv-path, or --conda-env")
-        raise typer.Exit(1)
+        if len(specified_options) > 1:
+            console.print(
+                "[bold red]"
+                "Error: Only one Python environment option can be specified at a time"
+                "[/bold red]"
+            )
+            console.print("Choose one of: --python-executable, --venv-path, or --conda-env")
+            raise typer.Exit(1)
 
     console.print("[bold green]Starting auto-tune-vllm optimization[/bold green]")
     console.print(f"Configuration: {config}")
@@ -222,20 +234,20 @@ def optimize_command(
                     "Ray auto-start disabled - requires existing cluster"
                     "[/yellow]"
                 )
+        elif backend.lower() == "afsbox":
+            from ..execution.afsbox import AFSBoxK8sBackend
+
+            effective_tuning_name = tuning_name or study_config.study_name
+            execution_backend = AFSBoxK8sBackend(
+                tuning_name=effective_tuning_name,
+                namespace=namespace,
+            )
+            console.print(
+                f"[blue]Using AFSBox Kubernetes execution (ModelTuning: {effective_tuning_name}, Namespace: {namespace})[/blue]"
+            )
         else:
             console.print(
-                "[bold red]"
-                "Error: Local execution backend is not supported in this version."
-                "[/bold red]"
-            )
-            console.print(
-                "[bold red]Only Ray distributed execution is available.[/bold red]"
-            )
-            console.print(
-                "[blue]Use --backend ray (default) or set up a Ray cluster.[/blue]"
-            )
-            console.print(
-                "[blue]See docs/ray_cluster_setup.md for Ray setup instructions.[/blue]"
+                f"[bold red]Error: Backend '{backend}' is not supported. Choose 'ray' or 'afsbox'.[/bold red]"
             )
             raise typer.Exit(1)
 

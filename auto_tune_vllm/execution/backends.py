@@ -19,6 +19,11 @@ from ..core.trial import TrialConfig, TrialResult
 
 logger = logging.getLogger(__name__)
 
+try:
+    from .afsbox import AFSBoxK8sBackend
+except ImportError:
+    AFSBoxK8sBackend = None
+
 
 # Simple Ray actor to hold cancellation state that can be modified externally
 
