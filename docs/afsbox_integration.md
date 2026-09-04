@@ -377,7 +377,11 @@ controllerManager:
 
 在真實 AFSBox 叢集（節點 `172.20.36.21`，配備 NVIDIA GB10 128GB Unified Memory GPU）上，使用 `facebook/opt-125m` 進行了 20 輪 TPE 貝氏最佳化自動調校，完整驗證了全鏈路的雲原生整合：
 
-### 11.1 核心修復與關鍵結論
+### 11.1 核心修復與實測總結
+- **試驗總覽**：20 輪測試全數順利完成（`Trial 0 ~ 19`），耗時約 40 分鐘，0 失敗率。
+- **最佳吞吐量冠軍**：**Trial 12**（`batch_size = 8, gpu_memory_utilization = 0.70`），Decode 聚合吞吐量達到 **`1,290.97 tok/s`**，相比 Baseline（1,189.99 tok/s）提升了 **`+8.5%`**！
+- **最低首字延遲**：**Trial 16**（`batch_size = 8, gpu_memory_utilization = 0.65`），TTFT (p50) 達到極致的 **`11.73 ms`**。
+
 1. **動態參數映射（Dynamic Parameter Mapping）**：
    - 實作在 `_map_parameters_to_serving_patch`，自動將 Optuna 推薦之下劃線命名轉為 K8s CRD CamelCase 欄位（如 `batchSize`, `gpuMemoryUtilization`），未知旗標自動包裝進 `extraCommand`。
 2. **防競爭 Rollout 同步（Generation-Aware Sync）**：
