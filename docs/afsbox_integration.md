@@ -366,7 +366,26 @@ controllerManager:
 
 | 專案 | 本地路徑 | 最新 Commit | 核心修改內容 |
 | :--- | :--- | :--- | :--- |
-| **1. auto-tuning-vllm** | `/mnt/d/work/ai-workspace/auto-tuning-vllm` | `61e45c8` | 1. 實作 `AFSBoxK8sBackend` 串接 K8s API<br>2. 實作 `_build_benchmark_suite()` 自動映射 Benchmark 參數<br>3. `synthesize_study_config_from_cr` 加入 `max_concurrent_trials: 1`<br>4. 新增 `sync_final_results_to_tuning`，調校結束自動回寫 `bestCandidate` 與 `paretoFrontier` 至 CR Status |
+| **1. auto-tuning-vllm** | `/mnt/d/work/ai-workspace/auto-tuning-vllm` | `8a43028` | 1. 實作 `AFSBoxK8sBackend` 串接 K8s API<br>2. 實作 `_build_benchmark_suite()` 自動映射 Benchmark 參數<br>3. 支援新版 ModelServing 規格（`batchSize`, `gpuMemoryUtilization`, `prefillSettings.maxBatchTokens`）<br>4. 實作 `observedGeneration` 等候防競爭機制<br>5. 串接獨立 `BenchmarkReport` 擷取 Throughput / TTFT 指標 |
 | **2. afsbox-controller** | `/mnt/d/work/afsbox/afsbox-controller` | `4471460` | 1. `modeltuning_types.go`: 擴充 `OptimizationSpec`、`ObjectiveSpec`、`ParetoFrontier`<br>2. 更新 CRD OpenAPI YAML schemas<br>3. `helpers.go`: 擴充 `setVariable` 支援 TP/PP/KV 快取，並實作 `syncGPUClaimCount` 避免 Webhook 雙源漂移<br>4. `modeltuning_controller.go`: 實作 `ensureTunerJob`，配置 `ActiveDeadlineSeconds: 7200`、`TTLSecondsAfterFinished: 86400` 與 `OPTUNA_TUNER_IMAGE` 環境變數覆寫機制 |
 | **3. afsbox-platform** | `/mnt/d/work/afsbox/afsbox-platform` | `50cdd79e` | 1. `models/template.go`: `ApplyTemplateRequest` 新增 `OptimizationRequest`<br>2. `services/template.go`: `ApplyTemplate` 透傳 `OptimizationSpec`<br>3. `models/tuning.go` & `services/tuning_report.go`: 調校報告投影新增 `OptimizationView`、`BestCandidate` 與 `ParetoFrontier` |
 | **4. afsbox-portal** | `/mnt/d/work/afsbox/afsbox-portal` | `5e05399a` | 1. `api-types.ts`: 定義前後端 Optuna 型別契約<br>2. `TuningConfigSection.tsx`: 部署精靈新增 Optuna 卡片、Sampler、輪數與目標切換<br>3. `ModelTuningReport.tsx`: 呈現 Optuna 摘要卡片，標註「🏆 最佳解」與「✨ 帕雷托前沿」徽章 |
+
+---
+
+## 十一、實機真實叢集整合驗證（NVIDIA GB10 實測記錄）
+
+在真實 AFSBox 叢集（節點 `172.20.36.21`，配備 NVIDIA GB10 128GB Unified Memory GPU）上，使用 `facebook/opt-125m` 進行了 20 輪 TPE 貝氏最佳化自動調校，完整驗證了全鏈路的雲原生整合：
+
+### 11.1 核心修復與關鍵結論
+1. **動態參數映射（Dynamic Parameter Mapping）**：
+   - 實作在 `_map_parameters_to_serving_patch`，自動將 Optuna 推薦之下劃線命名轉為 K8s CRD CamelCase 欄位（如 `batchSize`, `gpuMemoryUtilization`），未知旗標自動包裝進 `extraCommand`。
+2. **防競爭 Rollout 同步（Generation-Aware Sync）**：
+   - 解決 Client Patch 後 Controller 尚未反應的競態條件，確保 `status.observedGeneration >= metadata.generation` 且 `status.phase == Ready` 後才發起壓測。
+3. **獨立 BenchmarkReport 指標萃取**：
+   - 自動透過 `Benchmark.status.reportRef` 追蹤取得同名 `BenchmarkReport`，解析 `spec.items[0].metrics` 萃取出 Throughput、TTFT 等即時指標供 Optuna 計算目標分數。
+4. **Base 模型 Chat Template 注入**：
+   - 為 OPT-125M 等純 Base 模型追加 `--chat-template=/vllm-workspace/examples/template_chatml.jinja`，解決 AIPerf `/v1/chat/completions` 缺少對話樣板回傳 HTTP 400 的問題。
+5. **內網 Service 端點直連**：
+   - Benchmark CR 指定 `target.endpoint.url = http://<service>.<ns>.svc.cluster.local:8000/v1`，實現純淨內網直連壓測。
+

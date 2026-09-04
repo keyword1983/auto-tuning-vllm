@@ -252,7 +252,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
         try:
             # Patch experiment ModelServing spec
             body = {"spec": spec_patch}
-            self.custom_api.patch_namespaced_custom_object(
+            patched_obj = self.custom_api.patch_namespaced_custom_object(
                 group=AFSBOX_GROUP,
                 version=AFSBOX_VERSION,
                 namespace=self.namespace,
@@ -260,12 +260,19 @@ class AFSBoxK8sBackend(ExecutionBackend):
                 name=serving_name,
                 body=body,
             )
-            logger.info("Patched ModelServing %s with spec: %s", serving_name, spec_patch)
+            target_gen = patched_obj.get("metadata", {}).get("generation", 0)
+            logger.info(
+                "Patched ModelServing %s with spec: %s (target generation: %s)",
+                serving_name,
+                spec_patch,
+                target_gen,
+            )
         except Exception as e:
             logger.error("Failed to patch ModelServing %s: %s", serving_name, e)
             raise RuntimeError(f"AFSBox ModelServing patch failed: {e}")
 
         # 2. Wait for ModelServing to become Ready
+        time.sleep(2)
         start_wait = time.time()
         is_ready = False
         while time.time() - start_wait < self.deploy_timeout_seconds:
@@ -279,7 +286,8 @@ class AFSBoxK8sBackend(ExecutionBackend):
                 )
                 status = serving_obj.get("status", {})
                 phase = status.get("phase", "")
-                if phase == "Ready":
+                observed_gen = status.get("observedGeneration", 0)
+                if phase == "Ready" and observed_gen >= target_gen:
                     is_ready = True
                     break
                 elif phase == "Failed":
@@ -302,6 +310,11 @@ class AFSBoxK8sBackend(ExecutionBackend):
         # 3. Create Benchmark CR to initiate AIPerf load test
         exec_info.mark_benchmark_started()
         suite = self._build_benchmark_suite(trial_config)
+        endpoint_model = (
+            trial_config.benchmark_config.model
+            if trial_config.benchmark_config and trial_config.benchmark_config.model
+            else "afsbox/opt-125m"
+        )
         bench_body = {
             "apiVersion": f"{AFSBOX_GROUP}/{AFSBOX_VERSION}",
             "kind": "Benchmark",
@@ -317,6 +330,10 @@ class AFSBoxK8sBackend(ExecutionBackend):
                 "displayName": f"Optuna / {trial_id}",
                 "target": {
                     "modelServingRef": {"name": serving_name},
+                    "endpoint": {
+                        "url": f"http://{serving_name}.{self.namespace}.svc.cluster.local:8000/v1",
+                        "modelName": endpoint_model,
+                    },
                 },
                 "suite": suite,
             },
