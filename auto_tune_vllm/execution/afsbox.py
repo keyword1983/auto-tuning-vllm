@@ -205,9 +205,11 @@ class AFSBoxK8sBackend(ExecutionBackend):
 
             # GPU & Memory
             elif k_lower in ("gpu_memory_utilization", "gpu_mem_util"):
-                extra_args.append(f"--gpu-memory-utilization={v}")
+                spec_patch["gpuMemoryUtilization"] = str(v)
             elif k_lower in ("max_num_batched_tokens",):
-                extra_args.append(f"--max-num-batched-tokens={v}")
+                if "prefillSettings" not in spec_patch:
+                    spec_patch["prefillSettings"] = {}
+                spec_patch["prefillSettings"]["maxBatchTokens"] = str(v)
             elif k_lower in ("kv_cache_dtype",):
                 spec_patch["kvCacheDtype"] = str(v)
             elif k_lower in ("enable_cuda_graphs", "cuda_graph"):
@@ -224,7 +226,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
             spec_patch["parallelism"] = parallelism
 
         if extra_args:
-            spec_patch["extraArgs"] = extra_args
+            spec_patch["extraCommand"] = extra_args
 
         return spec_patch
 
@@ -379,11 +381,27 @@ class AFSBoxK8sBackend(ExecutionBackend):
                     exec_info.mark_benchmark_completed()
                     exec_info.mark_completed("success")
 
-                    # Extract metrics from results
+                    # Extract metrics from results or BenchmarkReport
                     results_list = status.get("results", [])
                     detailed_metrics = {}
                     if results_list and "metrics" in results_list[0]:
                         detailed_metrics = results_list[0]["metrics"]
+
+                    report_ref = status.get("reportRef", {}).get("name")
+                    if not detailed_metrics and report_ref:
+                        try:
+                            report_obj = self.custom_api.get_namespaced_custom_object(
+                                group=AFSBOX_GROUP,
+                                version=AFSBOX_VERSION,
+                                namespace=self.namespace,
+                                plural="benchmarkreports",
+                                name=report_ref,
+                            )
+                            items = report_obj.get("spec", {}).get("items", [])
+                            if items and "metrics" in items[0]:
+                                detailed_metrics = items[0]["metrics"]
+                        except Exception as err:
+                            logger.warning("Failed to fetch BenchmarkReport %s: %s", report_ref, err)
 
                     # Extract objective values
                     objective_values = self._extract_objectives(
@@ -489,22 +507,37 @@ class AFSBoxK8sBackend(ExecutionBackend):
         for obj in optimization_config.objectives:
             m_name = obj.metric.lower()
             if "token" in m_name and "second" in m_name:
-                v = metrics.get("output_tokens_per_sec_per_user") or metrics.get("output_token_throughput") or 0.0
+                v = (
+                    metrics.get("outputTokensPerSec")
+                    or metrics.get("outputTokensPerSecPerUser")
+                    or metrics.get("output_tokens_per_sec_per_user")
+                    or metrics.get("output_token_throughput")
+                    or 0.0
+                )
                 values.append(float(v))
             elif "first_token" in m_name or "ttft" in m_name:
-                percentile = getattr(obj, "percentile", "p50")
-                key = f"ttft_{percentile}"
-                v = metrics.get(key) or metrics.get("ttft_p50") or 0.0
+                percentile = getattr(obj, "percentile", "p50").lower()
+                ttft_data = metrics.get("ttft")
+                if isinstance(ttft_data, dict):
+                    v = ttft_data.get(percentile) or ttft_data.get("p50") or ttft_data.get("avg") or 0.0
+                else:
+                    v = metrics.get(f"ttft_{percentile}") or metrics.get("ttft_p50") or 0.0
                 values.append(float(v))
             elif "inter_token" in m_name or "itl" in m_name:
-                percentile = getattr(obj, "percentile", "p50")
-                key = f"itl_{percentile}"
-                v = metrics.get(key) or metrics.get("itl_p50") or 0.0
+                percentile = getattr(obj, "percentile", "p50").lower()
+                itl_data = metrics.get("itl")
+                if isinstance(itl_data, dict):
+                    v = itl_data.get(percentile) or itl_data.get("p50") or itl_data.get("avg") or 0.0
+                else:
+                    v = metrics.get(f"itl_{percentile}") or metrics.get("itl_p50") or 0.0
                 values.append(float(v))
             elif "latency" in m_name or "e2e" in m_name:
-                percentile = getattr(obj, "percentile", "p50")
-                key = f"e2e_{percentile}"
-                v = metrics.get(key) or metrics.get("e2e_p50") or 0.0
+                percentile = getattr(obj, "percentile", "p50").lower()
+                e2e_data = metrics.get("e2e")
+                if isinstance(e2e_data, dict):
+                    v = e2e_data.get(percentile) or e2e_data.get("p50") or e2e_data.get("avg") or 0.0
+                else:
+                    v = metrics.get(f"e2e_{percentile}") or metrics.get("e2e_p50") or 0.0
                 values.append(float(v))
             else:
                 v = metrics.get(obj.metric, 0.0)
