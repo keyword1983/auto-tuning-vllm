@@ -288,13 +288,17 @@ def optimize_command(
             )
             raise typer.Exit(1)
 
-        run_optimization_sync(
+        controller = run_optimization_sync(
             execution_backend,
             study_config,
             n_trials,
             final_max_concurrent_trials,
             create_db,
         )
+
+        if backend.lower() == "afsbox" and hasattr(execution_backend, "sync_final_results_to_tuning"):
+            results = controller.get_optimization_results()
+            execution_backend.sync_final_results_to_tuning(results)
 
     except Exception as e:
         console.print(f"[bold red]Optimization failed: {e}[/bold red]")
@@ -446,6 +450,7 @@ def run_optimization_sync(
 
     # Display results
     display_optimization_results(controller)
+    return controller
 
 
 def display_optimization_results(controller: StudyController):

@@ -512,6 +512,51 @@ class AFSBoxK8sBackend(ExecutionBackend):
 
         return values
 
+    def sync_final_results_to_tuning(self, results: Dict[str, Any]):
+        """Sync final best candidate and pareto frontier to ModelTuning.status."""
+        if not self.tuning_name:
+            return
+        try:
+            tuning_obj = self.custom_api.get_namespaced_custom_object(
+                group=AFSBOX_GROUP,
+                version=AFSBOX_VERSION,
+                namespace=self.namespace,
+                plural=PLURAL_TUNINGS,
+                name=self.tuning_name,
+            )
+            status = tuning_obj.get("status", {})
+            if results.get("type") == "multi_objective":
+                pareto_candidates = []
+                for p in results.get("pareto_front", []):
+                    trial_num = p.get("trial")
+                    if trial_num is not None:
+                        pareto_candidates.append(f"trial_{trial_num}")
+                status["paretoFrontier"] = pareto_candidates
+                if pareto_candidates:
+                    status["bestCandidate"] = pareto_candidates[0]
+            else:
+                best_num = results.get("best_trial_number")
+                if best_num is not None:
+                    status["bestCandidate"] = f"trial_{best_num}"
+
+            status["currentCandidate"] = ""
+            self.custom_api.patch_namespaced_custom_object_status(
+                group=AFSBOX_GROUP,
+                version=AFSBOX_VERSION,
+                namespace=self.namespace,
+                plural=PLURAL_TUNINGS,
+                name=self.tuning_name,
+                body={"status": status},
+            )
+            logger.info(
+                "Synced final results to ModelTuning %s status: best=%s, pareto=%s",
+                self.tuning_name,
+                status.get("bestCandidate"),
+                status.get("paretoFrontier"),
+            )
+        except Exception as e:
+            logger.warning("Failed to sync final results to ModelTuning %s: %s", self.tuning_name, e)
+
     def shutdown(self):
         """Clean shutdown of backend resources."""
         logger.info("AFSBoxK8sBackend shutdown completed.")
@@ -603,6 +648,7 @@ def synthesize_study_config_from_cr(tuning_name: str, namespace: str = "default"
             "objectives": objectives,
             "sampler": opt_spec.get("sampler", "nsga2" if len(objectives) > 1 else "tpe"),
             "n_trials": opt_spec.get("nTrials", 20),
+            "max_concurrent_trials": 1,
         },
         "benchmark": bench_dict,
         "parameters": params_dict,
