@@ -89,19 +89,79 @@ sequenceDiagram
 
 ---
 
-## 四、指標精準映射（Metric Alignment）
+## 五、Benchmark 壓測參數配置與映射機制（Benchmark Alignment）
 
-| 調校目標概念 | `auto-tuning-vllm` 規格 | AFSBox `AIPerf` 產出指標 | 最佳化方向 |
-| :--- | :--- | :--- | :--- |
-| **吞吐量 (Throughput)** | `output_tokens_per_second` | `output_tokens_per_sec_per_user` / `output_token_throughput` | `maximize` |
-| **首字延遲 (TTFT)** | `time_to_first_token_ms` | `ttft_p50` / `ttft_p95` | `minimize` |
-| **字間延遲 (ITL)** | `inter_token_latency_ms` | `itl_p50` / `itl_p95` | `minimize` |
-| **端到端延遲 (E2EL)** | `request_latency` | `e2e_p50` / `e2e_p95` | `minimize` |
-| **每秒請求數 (RPS)** | `requests_per_second` | `request_throughput` | `maximize` |
+在 `backend: afsbox` 架構下，壓力測試由 AFSBox 叢集內的 `Benchmark` CR（NVIDIA AIPerf 引擎）負責。系統支援雙模式獲取 Benchmark 壓測組態：
+
+### 5.1 雙模式運作
+1. **模式 A：AFSBox CR / Portal UI 驅動（推薦在生產與平台環境）**：
+   - 使用者在 Portal 介面選擇模型與壓測模板，組態自動存入 `ModelTuning.spec.testSuite`。
+   - `auto-tuning-vllm` 的 Tuner Runner 啟動後，`AFSBoxK8sBackend` 會**優先讀取並鎖定該 `testSuite`**，每輪 Optuna Trial 直接套用此測試規格。
+2. **模式 B：YAML / CLI 驅動（供研發實驗與離線自動化）**：
+   - 開發者撰寫 Study YAML 檔中的 `benchmark:` 區塊，`AFSBoxK8sBackend._build_benchmark_suite()` 會自動將其轉換為標準 AFSBox `Benchmark.spec.suite`。
+
+### 5.2 參數精準映射表
+| `auto-tuning-vllm` 欄位 | AFSBox `Benchmark.spec.suite[0].params` (AIPerf) | 說明與作用 |
+| :--- | :--- | :--- |
+| `samples` | `requestCount` | 總發送請求數 (例如 200) |
+| `rate` / `concurrency` | `concurrency` | 同時在途併發路數 (例如 16) |
+| `request_rate` | `requestRate` (`type: "request-rate"`) | 開迴路到達速率（設為 `"inf"` 則為閉迴路固定併發） |
+| `prompt_tokens` | `isl: { mean: 1024, stddev: 0 }` | 輸入序列長度常態分佈 |
+| `output_tokens` | `osl: { mean: 512, stddev: 0 }` | 輸出序列長度常態分佈 |
+| `dataset: "sharegpt"` | `dataset: "sharegpt"` (`type: "dataset-replay"`) | 資料集重放 (支援 `sharegpt`, `sonnet`) |
+| `max_seconds` | `timeoutSeconds` | 單次壓測最大執行超時時間 |
+| *(自動注入)* | `streaming: true` | **固定開啟**（SSE 串流是量測 TTFT/ITL 的必要前提） |
+| *(自動注入)* | `ignoreEOS: true` | **固定開啟**（強制測滿指定 OSL，避免模型提早結束導致吞吐被虛假高估） |
+
+### 5.3 Study YAML 範例 (`examples/study_config_afsbox.yaml`)
+```yaml
+study:
+  name: "llama3_afsbox_tuning"
+
+backend: "afsbox"
+afsbox:
+  namespace: "default"
+  tuning_name: "llama3-tuning-01"
+  deploy_timeout_seconds: 600
+
+optimization:
+  approach: "multi_objective"
+  objectives:
+    - metric: "output_tokens_per_second"
+      direction: "maximize"
+    - metric: "time_to_first_token_ms"
+      direction: "minimize"
+  sampler: "nsga2"
+  n_trials: 20
+
+benchmark:
+  benchmark_type: "aiperf"
+  model: "meta-llama/Meta-Llama-3-8B-Instruct"
+  samples: 200
+  rate: 16
+  request_rate: "inf"
+  prompt_tokens: 1024
+  output_tokens: 512
+  dataset: "sharegpt"
+  max_seconds: 300
+
+parameters:
+  tensor_parallel_size:
+    enabled: true
+    options: [1, 2]
+  max_num_batched_tokens:
+    enabled: true
+    options: [2048, 4096, 8192]
+  gpu_memory_utilization:
+    enabled: true
+    min: 0.80
+    max: 0.95
+    step: 0.05
+```
 
 ---
 
-## 五、各專案修改範圍與工作拆解
+## 六、各專案修改範圍與工作拆解
 
 本次實作涉及全部 4 個專案，均已建立分支 `feat/optuna-tuning`：
 

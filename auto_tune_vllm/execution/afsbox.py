@@ -22,6 +22,11 @@ PLURAL_BENCHMARKS = "benchmarks"
 PLURAL_TUNINGS = "modeltunings"
 
 
+LABEL_SERVING = "afsbox.asus.com/serving"
+LABEL_TUNING = "afsbox.asus.com/model-tuning"
+LABEL_CANDIDATE = "afsbox.asus.com/candidate"
+
+
 class AFSBoxK8sBackend(ExecutionBackend):
     """Execution backend interfacing with AFSBox Kubernetes CRDs (ModelServing and Benchmark)."""
 
@@ -45,6 +50,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
         self.deploy_timeout_seconds = deploy_timeout_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.active_trials: Dict[str, Dict[str, Any]] = {}
+        self._cached_tuning_test_suite: Optional[List[Dict[str, Any]]] = None
 
         # Lazy load kubernetes client to avoid import errors when running in environments without it
         try:
@@ -65,6 +71,102 @@ class AFSBoxK8sBackend(ExecutionBackend):
             )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize Kubernetes client for AFSBox backend: {e}")
+
+    def _get_parent_tuning_suite(self) -> Optional[List[Dict[str, Any]]]:
+        """Fetch testSuite from parent ModelTuning CR if available."""
+        if not self.tuning_name:
+            return None
+        if self._cached_tuning_test_suite is not None:
+            return self._cached_tuning_test_suite
+        try:
+            tuning_obj = self.custom_api.get_namespaced_custom_object(
+                group=AFSBOX_GROUP,
+                version=AFSBOX_VERSION,
+                namespace=self.namespace,
+                plural=PLURAL_TUNINGS,
+                name=self.tuning_name,
+            )
+            suite = tuning_obj.get("spec", {}).get("testSuite")
+            if suite:
+                self._cached_tuning_test_suite = suite
+                logger.info("Cached parent ModelTuning %s testSuite (%d items)", self.tuning_name, len(suite))
+                return suite
+        except Exception as e:
+            logger.warning("Could not fetch testSuite from ModelTuning %s: %s", self.tuning_name, e)
+        return None
+
+    def _build_benchmark_suite(self, trial_config: TrialConfig) -> List[Dict[str, Any]]:
+        """Construct Benchmark CR suite from ModelTuning CR or trial_config.benchmark_config."""
+        parent_suite = self._get_parent_tuning_suite()
+        if parent_suite:
+            logger.info("Using testSuite inherited from ModelTuning CR %s", self.tuning_name)
+            return parent_suite
+
+        bc = trial_config.benchmark_config
+        if not bc:
+            return [
+                {
+                    "name": "perf-eval",
+                    "type": "concurrency",
+                    "timeoutSeconds": 300,
+                    "params": {
+                        "concurrency": 8,
+                        "requestCount": 100,
+                        "streaming": True,
+                        "ignoreEOS": True,
+                    },
+                }
+            ]
+
+        # Determine benchmark item parameters
+        concurrency = bc.rate or bc.concurrency or 8
+        request_count = bc.samples or 100
+        timeout_seconds = bc.max_seconds or 300
+
+        params: Dict[str, Any] = {
+            "streaming": True,
+            "ignoreEOS": True,
+        }
+
+        # Input & output token distribution
+        if bc.prompt_tokens:
+            params["isl"] = {
+                "mean": int(bc.prompt_tokens),
+                "stddev": int(bc.prompt_tokens_stdev or 0),
+            }
+        if bc.output_tokens:
+            params["osl"] = {
+                "mean": int(bc.output_tokens),
+                "stddev": int(bc.output_tokens_stdev or 0),
+            }
+
+        # Dataset replay vs request-rate vs fixed concurrency
+        if bc.dataset and bc.dataset.lower() in ("sharegpt", "sonnet"):
+            suite_type = "dataset-replay"
+            params["dataset"] = bc.dataset.lower()
+            params["concurrency"] = int(concurrency)
+            params["requestCount"] = int(request_count)
+        elif bc.request_rate and str(bc.request_rate).lower() != "inf":
+            suite_type = "request-rate"
+            params["requestRate"] = str(bc.request_rate)
+            params["concurrency"] = int(concurrency)
+            params["requestCount"] = int(request_count)
+        elif concurrency == 1:
+            suite_type = "latency"
+            params["requestCount"] = int(request_count)
+        else:
+            suite_type = "concurrency"
+            params["concurrency"] = int(concurrency)
+            params["requestCount"] = int(request_count)
+
+        return [
+            {
+                "name": "perf-eval",
+                "type": suite_type,
+                "timeoutSeconds": int(timeout_seconds),
+                "params": params,
+            }
+        ]
 
     def _get_experiment_serving_name(self) -> str:
         """Get the deterministic experiment serving name."""
@@ -197,6 +299,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
 
         # 3. Create Benchmark CR to initiate AIPerf load test
         exec_info.mark_benchmark_started()
+        suite = self._build_benchmark_suite(trial_config)
         bench_body = {
             "apiVersion": f"{AFSBOX_GROUP}/{AFSBOX_VERSION}",
             "kind": "Benchmark",
@@ -204,8 +307,8 @@ class AFSBoxK8sBackend(ExecutionBackend):
                 "name": bench_name,
                 "namespace": self.namespace,
                 "labels": {
-                    "afsbox.asus.com/benchmark-serving": serving_name,
-                    "afsbox.asus.com/benchmark-candidate": trial_id,
+                    LABEL_SERVING: serving_name,
+                    LABEL_CANDIDATE: trial_id,
                 },
             },
             "spec": {
@@ -213,20 +316,12 @@ class AFSBoxK8sBackend(ExecutionBackend):
                 "target": {
                     "modelServingRef": {"name": serving_name},
                 },
-                "suite": [
-                    {
-                        "name": "perf-eval",
-                        "params": {
-                            "requestCount": 100,
-                            "concurrency": 8,
-                        },
-                    }
-                ],
+                "suite": suite,
             },
         }
 
         if self.tuning_name:
-            bench_body["metadata"]["labels"]["afsbox.asus.com/model-tuning"] = self.tuning_name
+            bench_body["metadata"]["labels"][LABEL_TUNING] = self.tuning_name
 
         try:
             self.custom_api.create_namespaced_custom_object(
@@ -305,10 +400,12 @@ class AFSBoxK8sBackend(ExecutionBackend):
                         success=True,
                     )
                     completed_results.append(result)
+                    self._sync_candidate_status_to_tuning(trial_id, bench_name, "Completed")
                     logger.info("Trial %s Benchmark %s completed: %s", trial_id, bench_name, objective_values)
 
                 elif phase == "Failed":
                     exec_info.mark_completed("failed")
+                    err_msg = status.get("message", "Benchmark failed")
                     result = TrialResult(
                         trial_id=trial_id,
                         trial_number=trial_config.trial_number,
@@ -316,10 +413,11 @@ class AFSBoxK8sBackend(ExecutionBackend):
                         objective_values=[],
                         execution_info=exec_info,
                         success=False,
-                        error_message=status.get("message", "Benchmark failed"),
+                        error_message=err_msg,
                     )
                     completed_results.append(result)
-                    logger.warning("Trial %s Benchmark %s failed: %s", trial_id, bench_name, status.get("message"))
+                    self._sync_candidate_status_to_tuning(trial_id, bench_name, "Failed", err_msg)
+                    logger.warning("Trial %s Benchmark %s failed: %s", trial_id, bench_name, err_msg)
 
                 else:
                     remaining_handles.append(handle)
@@ -329,6 +427,53 @@ class AFSBoxK8sBackend(ExecutionBackend):
                 remaining_handles.append(handle)
 
         return completed_results, remaining_handles
+
+    def _sync_candidate_status_to_tuning(
+        self, candidate_name: str, bench_name: str, phase: str, message: str = ""
+    ):
+        """Sync trial candidate progress back to parent ModelTuning.status.candidates."""
+        if not self.tuning_name:
+            return
+        try:
+            tuning_obj = self.custom_api.get_namespaced_custom_object(
+                group=AFSBOX_GROUP,
+                version=AFSBOX_VERSION,
+                namespace=self.namespace,
+                plural=PLURAL_TUNINGS,
+                name=self.tuning_name,
+            )
+            status = tuning_obj.get("status", {})
+            candidates = status.get("candidates", [])
+
+            found = False
+            for c in candidates:
+                if c.get("name") == candidate_name:
+                    c["phase"] = phase
+                    c["benchmarkRef"] = bench_name
+                    if message:
+                        c["message"] = message
+                    found = True
+                    break
+            if not found:
+                candidates.append({
+                    "name": candidate_name,
+                    "benchmarkRef": bench_name,
+                    "phase": phase,
+                    "message": message,
+                })
+
+            status["candidates"] = candidates
+            status["currentCandidate"] = candidate_name
+            self.custom_api.patch_namespaced_custom_object_status(
+                group=AFSBOX_GROUP,
+                version=AFSBOX_VERSION,
+                namespace=self.namespace,
+                plural=PLURAL_TUNINGS,
+                name=self.tuning_name,
+                body={"status": status},
+            )
+        except Exception as e:
+            logger.debug("Failed to sync candidate status to ModelTuning %s: %s", self.tuning_name, e)
 
     def _extract_objectives(
         self, metrics: Dict[str, Any], optimization_config: Any
@@ -375,3 +520,97 @@ class AFSBoxK8sBackend(ExecutionBackend):
         """Clean up active benchmarks."""
         logger.info("Cleaning up active trials for AFSBox backend.")
         self.active_trials.clear()
+
+
+def synthesize_study_config_from_cr(tuning_name: str, namespace: str = "default") -> str:
+    """Synthesize a study configuration YAML file from parent ModelTuning CR."""
+    import tempfile
+    import yaml
+    from kubernetes import client, config
+
+    try:
+        config.load_incluster_config()
+    except Exception:
+        config.load_kube_config()
+
+    custom_api = client.CustomObjectsApi()
+    tuning_obj = custom_api.get_namespaced_custom_object(
+        group=AFSBOX_GROUP,
+        version=AFSBOX_VERSION,
+        namespace=namespace,
+        plural=PLURAL_TUNINGS,
+        name=tuning_name,
+    )
+    spec = tuning_obj.get("spec", {})
+    opt_spec = spec.get("optimization", {}) or {}
+    test_suite = spec.get("testSuite", [])
+
+    objectives = []
+    for obj in opt_spec.get("objectives", []):
+        objectives.append({
+            "metric": obj.get("metric", "output_tokens_per_second"),
+            "direction": obj.get("direction", "maximize"),
+            "percentile": obj.get("percentile", "p50"),
+        })
+    if not objectives:
+        objectives = [
+            {"metric": "output_tokens_per_second", "direction": "maximize"},
+            {"metric": "time_to_first_token_ms", "direction": "minimize"},
+        ]
+
+    suite_params = test_suite[0].get("params", {}) if test_suite else {}
+    isl = suite_params.get("isl", {})
+    osl = suite_params.get("osl", {})
+    bench_dict = {
+        "benchmark_type": "aiperf",
+        "model": spec.get("servingTemplate", {}).get("model", {}).get("uri", "default"),
+        "samples": suite_params.get("requestCount", 100),
+        "rate": suite_params.get("concurrency", 8),
+        "prompt_tokens": isl.get("mean", 1000) if isinstance(isl, dict) else 1000,
+        "output_tokens": osl.get("mean", 1000) if isinstance(osl, dict) else 1000,
+        "dataset": suite_params.get("dataset"),
+        "max_seconds": test_suite[0].get("timeoutSeconds", 300) if test_suite else 300,
+    }
+
+    params_dict = {
+        "tensor_parallel_size": {
+            "enabled": True,
+            "options": [1, 2],
+        },
+        "max_num_batched_tokens": {
+            "enabled": True,
+            "options": [2048, 4096, 8192],
+        },
+        "gpu_memory_utilization": {
+            "enabled": True,
+            "min": 0.8,
+            "max": 0.95,
+            "step": 0.05,
+        },
+    }
+
+    study_dict = {
+        "study": {
+            "name": tuning_name,
+        },
+        "backend": "afsbox",
+        "afsbox": {
+            "namespace": namespace,
+            "tuning_name": tuning_name,
+        },
+        "optimization": {
+            "approach": "multi_objective" if len(objectives) > 1 else "single_objective",
+            "objectives": objectives,
+            "sampler": opt_spec.get("sampler", "nsga2" if len(objectives) > 1 else "tpe"),
+            "n_trials": opt_spec.get("nTrials", 20),
+        },
+        "benchmark": bench_dict,
+        "parameters": params_dict,
+    }
+
+    tmp_file = tempfile.NamedTemporaryFile(mode="w", suffix=f"_{tuning_name}.yaml", delete=False)
+    yaml.safe_dump(study_dict, tmp_file, sort_keys=False)
+    tmp_file.close()
+    logger.info("Synthesized study configuration from ModelTuning CR: %s", tmp_file.name)
+    return tmp_file.name
+

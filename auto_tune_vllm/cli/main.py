@@ -111,7 +111,7 @@ def _display_log_viewing_instructions(config: StudyConfig):
 
 @app.command("optimize")
 def optimize_command(
-    config: str = typer.Option(..., "--config", "-c", help="Study configuration file"),
+    config: Optional[str] = typer.Option(None, "--config", "-c", help="Study configuration file"),
     backend: str = typer.Option(
         "ray",
         "--backend",
@@ -202,6 +202,20 @@ def optimize_command(
 
     try:
         # Load configuration
+        if config is None:
+            if backend.lower() == "afsbox" and tuning_name:
+                from ..execution.afsbox import synthesize_study_config_from_cr
+
+                console.print(
+                    f"[blue]Synthesizing study config from AFSBox ModelTuning CR: {tuning_name}[/blue]"
+                )
+                config = synthesize_study_config_from_cr(tuning_name, namespace)
+            else:
+                console.print(
+                    "[bold red]Error: Missing required option '--config' / '-c'[/bold red]"
+                )
+                raise typer.Exit(1)
+
         config_path = Path(config)
         if not config_path.exists():
             console.print(

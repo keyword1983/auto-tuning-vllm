@@ -1,0 +1,54 @@
+# Example study configuration using the AFSBox Kubernetes execution backend
+# Demonstrates multi-objective tuning (throughput vs TTFT) on AFSBox ModelServing + AIPerf.
+
+study:
+  name: "llama3_afsbox_tuning"
+
+backend: "afsbox"
+afsbox:
+  namespace: "default"
+  tuning_name: "llama3-tuning-01"
+  deploy_timeout_seconds: 600
+  poll_interval_seconds: 10
+
+optimization:
+  approach: "multi_objective"
+  objectives:
+    - metric: "output_tokens_per_second"
+      direction: "maximize"
+      percentile: "median"
+    - metric: "time_to_first_token_ms"
+      direction: "minimize"
+      percentile: "p50"
+  sampler: "nsga2"
+  n_trials: 20
+
+benchmark:
+  benchmark_type: "aiperf"
+  model: "meta-llama/Meta-Llama-3-8B-Instruct"
+  samples: 200
+  rate: 16
+  request_rate: "inf"
+  prompt_tokens: 1024
+  output_tokens: 512
+  dataset: "sharegpt"
+  max_seconds: 300
+
+parameters:
+  tensor_parallel_size:
+    enabled: true
+    options: [1, 2]
+
+  max_num_batched_tokens:
+    enabled: true
+    options: [2048, 4096, 8192]
+
+  gpu_memory_utilization:
+    enabled: true
+    min: 0.80
+    max: 0.95
+    step: 0.05
+
+  kv_cache_dtype:
+    enabled: true
+    options: ["auto", "fp8"]
