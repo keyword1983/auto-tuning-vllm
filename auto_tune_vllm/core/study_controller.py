@@ -44,7 +44,9 @@ class StudyController:
         self.config: StudyConfig = config
         self.active_trials: dict[str, JobHandle] = {}
         self.trial_objects: dict[int, optuna.Trial] = {}
-        self.completed_trials: int = 0
+        self.completed_trials: int = len(
+            [t for t in study.trials if t.state in (TrialState.COMPLETE, TrialState.PRUNED)]
+        )
         self.baseline_results: dict[
             int, list[float]
         ] = {}  # concurrency -> objective_values
@@ -474,7 +476,10 @@ class StudyController:
         Returns:
             Completed Optuna study
         """
-        total_trials = n_trials or self.config.optimization.n_trials
+        if n_trials is not None:
+            total_trials = self.completed_trials + n_trials
+        else:
+            total_trials = self.config.optimization.n_trials
 
         # Require explicit, positive concurrency specification
         if max_concurrent_trials is None:
@@ -976,7 +981,7 @@ class StudyController:
         if self.config.optimization.is_multi_objective:
             # Multi-objective results
             pareto_front = []
-            for t in self.study.best_trials[:10]:  # Top 10
+            for t in self.study.best_trials:
                 trial_data = {"trial": t.number, "values": t.values, "params": t.params}
 
                 # Add baseline comparison for each objective
@@ -1022,10 +1027,31 @@ class StudyController:
             }
         else:
             # Single objective results
-            best_trial = self.study.best_trial
+            try:
+                best_trial = self.study.best_trial
+            except (ValueError, KeyError):
+                best_trial = None
+
             if not self.config.optimization.objectives:
                 raise ValueError("No objectives defined")
             objective = self.config.optimization.objectives[0]
+
+            if best_trial is None:
+                return {
+                    "type": "single_objective",
+                    "approach": self.config.optimization.approach,
+                    "objective": {
+                        "metric": objective.metric,
+                        "direction": objective.direction,
+                        "percentile": objective.percentile,
+                    },
+                    "n_trials": len(self.study.trials),
+                    "best_value": None,
+                    "best_params": {},
+                    "best_trial_number": None,
+                    "baseline_value": baseline_result[0] if baseline_result else None,
+                    "baseline_improvement": None,
+                }
 
             # Calculate baseline improvement
             baseline_improvement = None

@@ -393,3 +393,11 @@ controllerManager:
 5. **內網 Service 端點直連**：
    - Benchmark CR 指定 `target.endpoint.url = http://<service>.<ns>.svc.cluster.local:8000/v1`，實現純淨內網直連壓測。
 
+---
+
+## 十二、多推論引擎調優支援設計（vLLM, SGLang, llama.cpp）
+
+關於 AFSBox 跨引擎抽象架構分析、各引擎通用欄位映射表、AIPerf 評測協議相容性與多引擎調優完整設計方案，請參閱獨立設計文檔：
+- [AFSBox 多推論引擎調優支援架構設計 (vLLM, SGLang, llama.cpp)](file:///mnt/d/work/ai-workspace/auto-tuning-vllm/docs/multi_engine_support_design.md)
+
+

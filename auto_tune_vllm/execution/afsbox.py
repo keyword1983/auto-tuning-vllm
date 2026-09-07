@@ -6,6 +6,7 @@ and triggering AFSBox Benchmark (AIPerf) jobs via Kubernetes Custom Resources.
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,6 +15,16 @@ from ..core.trial import ExecutionInfo, TrialConfig, TrialResult
 from .backends import ExecutionBackend, JobHandle
 
 logger = logging.getLogger(__name__)
+
+
+def _deep_update(target: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively update nested dictionary."""
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(target.get(k), dict):
+            _deep_update(target[k], v)
+        else:
+            target[k] = v
+    return target
 
 AFSBOX_GROUP = "afsbox.asus.com"
 AFSBOX_VERSION = "v1beta1"
@@ -34,23 +45,38 @@ class AFSBoxK8sBackend(ExecutionBackend):
         self,
         tuning_name: Optional[str] = None,
         namespace: str = "default",
+        serving_name: Optional[str] = None,
+        serving_template: Optional[Dict[str, Any]] = None,
+        cleanup_serving: bool = False,
         deploy_timeout_seconds: int = 1800,
         poll_interval_seconds: int = 10,
     ):
         """Initialize AFSBox Kubernetes execution backend.
 
         Args:
-            tuning_name: Name of the parent ModelTuning CR (if run as part of a ModelTuning session).
+            tuning_name: Name of parent ModelTuning CR (if run as part of a ModelTuning session).
             namespace: Kubernetes namespace where ModelServing and Benchmark CRs reside.
+            serving_name: Explicit name of experiment ModelServing CR.
+            serving_template: Custom ModelServing spec dictionary template to generate serving if missing.
+            cleanup_serving: Whether to delete the ModelServing CR upon study completion.
             deploy_timeout_seconds: Max seconds to wait for ModelServing to become Ready after patch.
             poll_interval_seconds: Interval between status polls.
         """
         self.tuning_name = tuning_name
         self.namespace = namespace
+        self.serving_name = (
+            serving_name
+            or (f"{tuning_name}-exp" if tuning_name else "optuna-tune-exp")
+        )
+        self.serving_template = serving_template
+        self.cleanup_serving = cleanup_serving
         self.deploy_timeout_seconds = deploy_timeout_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.active_trials: Dict[str, Dict[str, Any]] = {}
+        self._cached_tuning_cr: Optional[Dict[str, Any]] = None
         self._cached_tuning_test_suite: Optional[List[Dict[str, Any]]] = None
+        self._serving_created_by_us: bool = False
+        self._serving_just_created: bool = False
 
         # Lazy load kubernetes client to avoid import errors when running in environments without it
         try:
@@ -72,12 +98,12 @@ class AFSBoxK8sBackend(ExecutionBackend):
         except Exception as e:
             raise RuntimeError(f"Failed to initialize Kubernetes client for AFSBox backend: {e}")
 
-    def _get_parent_tuning_suite(self) -> Optional[List[Dict[str, Any]]]:
-        """Fetch testSuite from parent ModelTuning CR if available."""
+    def _get_parent_tuning_cr(self) -> Optional[Dict[str, Any]]:
+        """Fetch parent ModelTuning CR if available."""
         if not self.tuning_name:
             return None
-        if self._cached_tuning_test_suite is not None:
-            return self._cached_tuning_test_suite
+        if self._cached_tuning_cr is not None:
+            return self._cached_tuning_cr
         try:
             tuning_obj = self.custom_api.get_namespaced_custom_object(
                 group=AFSBOX_GROUP,
@@ -86,14 +112,29 @@ class AFSBoxK8sBackend(ExecutionBackend):
                 plural=PLURAL_TUNINGS,
                 name=self.tuning_name,
             )
-            suite = tuning_obj.get("spec", {}).get("testSuite")
+            self._cached_tuning_cr = tuning_obj
+            return tuning_obj
+        except Exception as e:
+            logger.warning("Could not fetch ModelTuning %s: %s", self.tuning_name, e)
+            return None
+
+    def _get_parent_tuning_suite(self) -> Optional[List[Dict[str, Any]]]:
+        """Fetch testSuite from parent ModelTuning CR if available."""
+        if self._cached_tuning_test_suite is not None:
+            return self._cached_tuning_test_suite
+        cr = self._get_parent_tuning_cr()
+        if cr:
+            suite = cr.get("spec", {}).get("testSuite")
             if suite:
                 self._cached_tuning_test_suite = suite
                 logger.info("Cached parent ModelTuning %s testSuite (%d items)", self.tuning_name, len(suite))
                 return suite
-        except Exception as e:
-            logger.warning("Could not fetch testSuite from ModelTuning %s: %s", self.tuning_name, e)
         return None
+
+    def _get_parent_tuning_spec(self) -> Optional[Dict[str, Any]]:
+        """Fetch spec from parent ModelTuning CR if available."""
+        cr = self._get_parent_tuning_cr()
+        return cr.get("spec", {}) if cr else None
 
     def _build_benchmark_suite(self, trial_config: TrialConfig) -> List[Dict[str, Any]]:
         """Construct Benchmark CR suite from ModelTuning CR or trial_config.benchmark_config."""
@@ -170,9 +211,162 @@ class AFSBoxK8sBackend(ExecutionBackend):
 
     def _get_experiment_serving_name(self) -> str:
         """Get the deterministic experiment serving name."""
+        return self.serving_name
+
+    def ensure_serving_exists(self, trial_config: Optional[TrialConfig] = None) -> None:
+        """Ensure experiment ModelServing CR exists in Kubernetes; create it if not present."""
+        serving_name = self.serving_name
+        try:
+            self.custom_api.get_namespaced_custom_object(
+                group=AFSBOX_GROUP,
+                version=AFSBOX_VERSION,
+                namespace=self.namespace,
+                plural=PLURAL_SERVINGS,
+                name=serving_name,
+            )
+            logger.info("Target ModelServing %s already exists in %s", serving_name, self.namespace)
+            return
+        except Exception as e:
+            from kubernetes.client.exceptions import ApiException
+
+            is_not_found = (
+                (isinstance(e, ApiException) and e.status == 404)
+                or "NotFound" in str(e)
+                or "404" in str(e)
+            )
+            if not is_not_found:
+                logger.warning("Error checking ModelServing %s: %s", serving_name, e)
+            logger.info(
+                "ModelServing %s not found in namespace %s. Generating and creating it...",
+                serving_name,
+                self.namespace,
+            )
+
+        # Build initial ModelServing spec
+        serving_spec: Dict[str, Any] = {}
+
+        # 1. From provided serving_template (dict)
+        if self.serving_template:
+            if "spec" in self.serving_template:
+                serving_spec = copy.deepcopy(self.serving_template["spec"])
+            else:
+                serving_spec = copy.deepcopy(self.serving_template)
+            logger.info("Using provided serving_template for %s", serving_name)
+        # 2. Inherit from parent ModelTuning CR spec.servingTemplate
+        elif self.tuning_name:
+            parent_spec = self._get_parent_tuning_spec()
+            if parent_spec and "servingTemplate" in parent_spec:
+                serving_spec = copy.deepcopy(parent_spec["servingTemplate"])
+                logger.info("Inherited servingTemplate from parent ModelTuning %s", self.tuning_name)
+
+        # 3. Default fallback spec
+        if not serving_spec:
+            logger.info("Building default baseline ModelServing spec for %s", serving_name)
+            model_name = "facebook-opt-125m"
+            served_name = "opt-125m"
+            if trial_config and trial_config.benchmark_config and trial_config.benchmark_config.model:
+                raw_model = trial_config.benchmark_config.model
+                served_name = raw_model.split("/")[-1]
+                model_name = raw_model.replace("/", "-")
+
+            serving_spec = {
+                "image": "docker.io/vllm/vllm-openai:v0.27.1",
+                "engine": {
+                    "servicePort": 8000,
+                    "type": "vllm",
+                },
+                "modelType": "llm",
+                "servedModelName": served_name,
+                "command": [
+                    "vllm",
+                    "serve",
+                    "${MODEL_PATH}",
+                    "--served-model-name=${SERVED_MODEL_NAME}",
+                    "--port=${SERVICE_PORT}",
+                    "--enforce-eager",
+                    "--chat-template=/vllm-workspace/examples/template_chatml.jinja",
+                ],
+                "model": {
+                    "valueFrom": {
+                        "kind": "ClusterModelRepository",
+                        "name": model_name,
+                    }
+                },
+                "replicas": 1,
+                "externalAccess": False,
+                "cacheAwareRouting": False,
+                "gpuClaim": {
+                    "className": "nvidia-gb10",
+                    "requests": {
+                        "memoryMB": 16384,
+                    },
+                },
+                "parallelism": {
+                    "tp": 1,
+                },
+                "contextLength": "2048",
+                "batchSize": "32",
+                "gpuMemoryUtilization": "0.8",
+            }
+
+        if "image" not in serving_spec:
+            serving_spec["image"] = "docker.io/vllm/vllm-openai:v0.27.1"
+
+        if "command" not in serving_spec and "extraCommand" not in serving_spec:
+            serving_spec["command"] = [
+                "vllm",
+                "serve",
+                "${MODEL_PATH}",
+                "--served-model-name=${SERVED_MODEL_NAME}",
+                "--port=${SERVICE_PORT}",
+                "--enforce-eager",
+                "--chat-template=/vllm-workspace/examples/template_chatml.jinja",
+            ]
+
+        # Apply candidate parameters from trial 0 if present
+        if trial_config and trial_config.parameters:
+            initial_patch = self._map_parameters_to_serving_patch(trial_config.parameters)
+            _deep_update(serving_spec, initial_patch)
+
+        # Ensure extraCommand has chat template if extraCommand is used and command doesn't have it
+        if "command" not in serving_spec:
+            if "extraCommand" not in serving_spec:
+                serving_spec["extraCommand"] = ["--chat-template=/vllm-workspace/examples/template_chatml.jinja"]
+            elif not any("--chat-template" in cmd for cmd in serving_spec["extraCommand"]):
+                serving_spec["extraCommand"].append("--chat-template=/vllm-workspace/examples/template_chatml.jinja")
+
+        body = {
+            "apiVersion": f"{AFSBOX_GROUP}/{AFSBOX_VERSION}",
+            "kind": "ModelServing",
+            "metadata": {
+                "name": serving_name,
+                "namespace": self.namespace,
+                "labels": {
+                    "app.kubernetes.io/managed-by": "auto-tuning-vllm",
+                },
+            },
+            "spec": serving_spec,
+        }
         if self.tuning_name:
-            return f"{self.tuning_name}-exp"
-        return "optuna-tune-exp"
+            body["metadata"]["labels"][LABEL_TUNING] = self.tuning_name
+
+        try:
+            self.custom_api.create_namespaced_custom_object(
+                group=AFSBOX_GROUP,
+                version=AFSBOX_VERSION,
+                namespace=self.namespace,
+                plural=PLURAL_SERVINGS,
+                body=body,
+            )
+            self._serving_created_by_us = True
+            self._serving_just_created = True
+            logger.info("Successfully created ModelServing %s in %s", serving_name, self.namespace)
+        except Exception as e:
+            if "AlreadyExists" in str(e):
+                logger.info("ModelServing %s already exists (concurrent creation)", serving_name)
+            else:
+                logger.error("Failed to create ModelServing %s: %s", serving_name, e)
+                raise RuntimeError(f"AFSBox ModelServing creation failed: {e}")
 
     def _map_parameters_to_serving_patch(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Map Optuna parameter dictionary to AFSBox ModelServing spec patch.
@@ -247,29 +441,42 @@ class AFSBoxK8sBackend(ExecutionBackend):
         exec_info = ExecutionInfo()
         exec_info.mark_vllm_started()
 
+        # 0. Ensure experiment ModelServing exists (auto-create if missing)
+        self.ensure_serving_exists(trial_config)
+
         # 1. Update ModelServing with candidate parameters
-        spec_patch = self._map_parameters_to_serving_patch(trial_config.parameters)
-        try:
-            # Patch experiment ModelServing spec
-            body = {"spec": spec_patch}
-            patched_obj = self.custom_api.patch_namespaced_custom_object(
-                group=AFSBOX_GROUP,
-                version=AFSBOX_VERSION,
-                namespace=self.namespace,
-                plural=PLURAL_SERVINGS,
-                name=serving_name,
-                body=body,
-            )
-            target_gen = patched_obj.get("metadata", {}).get("generation", 0)
+        if self._serving_just_created:
+            target_gen = 1
+            self._serving_just_created = False
             logger.info(
-                "Patched ModelServing %s with spec: %s (target generation: %s)",
+                "ModelServing %s was created for trial %s (target generation: %s)",
                 serving_name,
-                spec_patch,
+                trial_id,
                 target_gen,
             )
-        except Exception as e:
-            logger.error("Failed to patch ModelServing %s: %s", serving_name, e)
-            raise RuntimeError(f"AFSBox ModelServing patch failed: {e}")
+        else:
+            spec_patch = self._map_parameters_to_serving_patch(trial_config.parameters)
+            try:
+                # Patch experiment ModelServing spec
+                body = {"spec": spec_patch}
+                patched_obj = self.custom_api.patch_namespaced_custom_object(
+                    group=AFSBOX_GROUP,
+                    version=AFSBOX_VERSION,
+                    namespace=self.namespace,
+                    plural=PLURAL_SERVINGS,
+                    name=serving_name,
+                    body=body,
+                )
+                target_gen = patched_obj.get("metadata", {}).get("generation", 0)
+                logger.info(
+                    "Patched ModelServing %s with spec: %s (target generation: %s)",
+                    serving_name,
+                    spec_patch,
+                    target_gen,
+                )
+            except Exception as e:
+                logger.error("Failed to patch ModelServing %s: %s", serving_name, e)
+                raise RuntimeError(f"AFSBox ModelServing patch failed: {e}")
 
         # 2. Wait for ModelServing to become Ready
         time.sleep(2)
@@ -291,9 +498,12 @@ class AFSBoxK8sBackend(ExecutionBackend):
                     is_ready = True
                     break
                 elif phase == "Failed":
-                    raise RuntimeError(
-                        f"ModelServing {serving_name} failed: {status.get('message', 'Unknown error')}"
-                    )
+                    conditions = status.get("conditions", [])
+                    err_msg = status.get("message") or (conditions[0].get("message") if conditions else "Unknown error")
+                    logger.error("ModelServing %s entered Failed phase: %s", serving_name, err_msg)
+                    raise RuntimeError(f"ModelServing {serving_name} failed: {err_msg}")
+            except RuntimeError:
+                raise
             except Exception as e:
                 logger.warning("Checking ModelServing %s status warning: %s", serving_name, e)
 
@@ -310,11 +520,14 @@ class AFSBoxK8sBackend(ExecutionBackend):
         # 3. Create Benchmark CR to initiate AIPerf load test
         exec_info.mark_benchmark_started()
         suite = self._build_benchmark_suite(trial_config)
-        endpoint_model = (
-            trial_config.benchmark_config.model
-            if trial_config.benchmark_config and trial_config.benchmark_config.model
-            else "afsbox/opt-125m"
-        )
+        endpoint_model = None
+        if self.serving_template and self.serving_template.get("servedModelName"):
+            endpoint_model = self.serving_template.get("servedModelName")
+        elif trial_config.benchmark_config and trial_config.benchmark_config.model:
+            endpoint_model = trial_config.benchmark_config.model
+        else:
+            endpoint_model = "opt-125m"
+
         bench_body = {
             "apiVersion": f"{AFSBOX_GROUP}/{AFSBOX_VERSION}",
             "kind": "Benchmark",
@@ -514,12 +727,56 @@ class AFSBoxK8sBackend(ExecutionBackend):
         self, metrics: Dict[str, Any], optimization_config: Any
     ) -> List[float]:
         """Extract objective values based on configured optimization targets."""
+        def _parse_val(v: Any) -> float:
+            if v is None:
+                return 0.0
+            if isinstance(v, (int, float)):
+                return float(v)
+            s = str(v).strip()
+            if not s:
+                return 0.0
+            if s.endswith("ms"):
+                try:
+                    return float(s[:-2])
+                except ValueError:
+                    pass
+            elif s.endswith("m"):  # milli (e.g. 1234900m -> 1234.9)
+                try:
+                    return float(s[:-1]) / 1000.0
+                except ValueError:
+                    pass
+            elif s.endswith("k") or s.endswith("K"):
+                try:
+                    return float(s[:-1]) * 1000.0
+                except ValueError:
+                    pass
+            elif s.endswith("M"):
+                try:
+                    return float(s[:-1]) * 1000000.0
+                except ValueError:
+                    pass
+            elif s.endswith("u"):
+                try:
+                    return float(s[:-1]) / 1000000.0
+                except ValueError:
+                    pass
+            elif s.endswith("n"):
+                try:
+                    return float(s[:-1]) / 1000000000.0
+                except ValueError:
+                    pass
+            try:
+                return float(s)
+            except ValueError:
+                logger.warning("Could not parse metric value to float: %r", v)
+                return 0.0
+
         values: List[float] = []
 
         if not optimization_config or not hasattr(optimization_config, "objectives"):
             # Default fallback: maximize throughput
             tps = metrics.get("output_tokens_per_sec_per_user") or metrics.get("output_token_throughput") or 0.0
-            return [float(tps)]
+            return [_parse_val(tps)]
 
         for obj in optimization_config.objectives:
             m_name = obj.metric.lower()
@@ -531,7 +788,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
                     or metrics.get("output_token_throughput")
                     or 0.0
                 )
-                values.append(float(v))
+                values.append(_parse_val(v))
             elif "first_token" in m_name or "ttft" in m_name:
                 percentile = getattr(obj, "percentile", "p50").lower()
                 ttft_data = metrics.get("ttft")
@@ -539,7 +796,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
                     v = ttft_data.get(percentile) or ttft_data.get("p50") or ttft_data.get("avg") or 0.0
                 else:
                     v = metrics.get(f"ttft_{percentile}") or metrics.get("ttft_p50") or 0.0
-                values.append(float(v))
+                values.append(_parse_val(v))
             elif "inter_token" in m_name or "itl" in m_name:
                 percentile = getattr(obj, "percentile", "p50").lower()
                 itl_data = metrics.get("itl")
@@ -547,7 +804,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
                     v = itl_data.get(percentile) or itl_data.get("p50") or itl_data.get("avg") or 0.0
                 else:
                     v = metrics.get(f"itl_{percentile}") or metrics.get("itl_p50") or 0.0
-                values.append(float(v))
+                values.append(_parse_val(v))
             elif "latency" in m_name or "e2e" in m_name:
                 percentile = getattr(obj, "percentile", "p50").lower()
                 e2e_data = metrics.get("e2e")
@@ -555,10 +812,10 @@ class AFSBoxK8sBackend(ExecutionBackend):
                     v = e2e_data.get(percentile) or e2e_data.get("p50") or e2e_data.get("avg") or 0.0
                 else:
                     v = metrics.get(f"e2e_{percentile}") or metrics.get("e2e_p50") or 0.0
-                values.append(float(v))
+                values.append(_parse_val(v))
             else:
                 v = metrics.get(obj.metric, 0.0)
-                values.append(float(v))
+                values.append(_parse_val(v))
 
         return values
 
@@ -609,12 +866,36 @@ class AFSBoxK8sBackend(ExecutionBackend):
 
     def shutdown(self):
         """Clean shutdown of backend resources."""
+        if self.cleanup_serving and self._serving_created_by_us:
+            self._delete_serving()
         logger.info("AFSBoxK8sBackend shutdown completed.")
 
     def cleanup_all_trials(self):
-        """Clean up active benchmarks."""
+        """Clean up active benchmarks and experiment serving if configured."""
         logger.info("Cleaning up active trials for AFSBox backend.")
         self.active_trials.clear()
+        if self.cleanup_serving and self._serving_created_by_us:
+            self._delete_serving()
+
+    def _delete_serving(self):
+        """Delete experiment ModelServing CR if created by this backend."""
+        if not self._serving_created_by_us:
+            return
+        serving_name = self._get_experiment_serving_name()
+        try:
+            logger.info("Deleting ModelServing %s in namespace %s...", serving_name, self.namespace)
+            self.custom_api.delete_namespaced_custom_object(
+                group=AFSBOX_GROUP,
+                version=AFSBOX_VERSION,
+                namespace=self.namespace,
+                plural=PLURAL_SERVINGS,
+                name=serving_name,
+            )
+            self._serving_created_by_us = False
+            logger.info("Deleted ModelServing %s", serving_name)
+        except Exception as e:
+            if "NotFound" not in str(e):
+                logger.warning("Failed to delete ModelServing %s: %s", serving_name, e)
 
 
 def synthesize_study_config_from_cr(tuning_name: str, namespace: str = "default") -> str:

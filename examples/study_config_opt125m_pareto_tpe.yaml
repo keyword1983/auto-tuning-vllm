@@ -1,5 +1,5 @@
 study:
-  prefix: "opt125m_tpe"
+  prefix: "opt125m_pareto_tpe"
 
 backend: "afsbox"
 
@@ -46,14 +46,17 @@ baseline:
   enabled: false
 
 optimization:
-  approach: "single_objective"
+  approach: "multi_objective"
   objectives:
     - metric: "output_tokens_per_second"
       direction: "maximize"
       percentile: "p50"
+    - metric: "time_to_first_token_ms"
+      direction: "minimize"
+      percentile: "p50"
   sampler: "tpe"
-  n_trials: 2
-  n_startup_trials: 1
+  n_trials: 20
+  n_startup_trials: 5
   max_concurrent_trials: 1
 
 benchmark:

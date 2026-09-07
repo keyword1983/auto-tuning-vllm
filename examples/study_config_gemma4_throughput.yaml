@@ -1,0 +1,47 @@
+study:
+  prefix: "gemma4_throughput_tuning"
+
+optimization:
+  preset: "high_throughput"  # Maximize token generation throughput
+  sampler: "tpe"
+  n_trials: 30
+  n_startup_trials: 5
+  max_concurrent_trials: 1
+
+benchmark:
+  benchmark_type: "guidellm"
+  model: "/models/gemma-4-E2B-it"
+  max_seconds: 60           # 60 seconds per trial
+  samples: 50               # Fast synthetic prompt generation
+  dataset: null
+  prompt_tokens: 1024
+  output_tokens: 512
+  rate: 30
+
+logging:
+  file_path: "./logs"
+  log_level: "INFO"
+
+static_parameters:
+  max_model_len: 8192
+  dtype: "bfloat16"
+
+parameters:
+  max_num_seqs:
+    enabled: true
+    min: 16
+    max: 256
+    step: 16
+
+  max_num_batched_tokens:
+    enabled: true
+    min: 2048
+    max: 32768
+    step: 1024
+
+  block_size:
+    enabled: true
+    options: [16, 32]
+
+static_environment_variables:
+  VLLM_STARTUP_TIMEOUT: "300"

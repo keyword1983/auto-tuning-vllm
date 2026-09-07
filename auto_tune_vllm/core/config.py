@@ -291,6 +291,7 @@ class StudyConfig:
         False  # Flag to indicate explicit name usage (affects load_if_exists behavior)
     )
     constraints: list[Constraint] = field(default_factory=list)
+    afsbox: Optional[Dict[str, Any]] = None  # AFSBox Kubernetes configuration and serving template
 
     @classmethod
     def from_file(
@@ -604,6 +605,7 @@ class ConfigValidator:
             study_prefix=study_prefix,
             use_explicit_name=use_explicit_name,
             constraints=constraints,
+            afsbox=raw_config.get("afsbox"),
         )
 
     def _infer_parameter_type(self, parameter_config: dict[str, Any]):

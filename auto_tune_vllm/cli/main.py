@@ -132,6 +132,16 @@ def optimize_command(
         "-n",
         help="Kubernetes namespace (for --backend afsbox)",
     ),
+    serving_name: Optional[str] = typer.Option(
+        None,
+        "--serving-name",
+        help="Explicit name of ModelServing CR (for --backend afsbox)",
+    ),
+    cleanup_serving: bool = typer.Option(
+        False,
+        "--cleanup-serving",
+        help="Delete ModelServing CR when study completes (for --backend afsbox)",
+    ),
     n_trials: Optional[int] = typer.Option(
         None, "--trials", "-n", help="Number of trials (overrides config)"
     ),
@@ -254,13 +264,30 @@ def optimize_command(
         elif backend.lower() == "afsbox":
             from ..execution.afsbox import AFSBoxK8sBackend
 
-            effective_tuning_name = tuning_name or study_config.study_name
+            afsbox_cfg = getattr(study_config, "afsbox", None) or {}
+            effective_tuning_name = tuning_name or afsbox_cfg.get("tuning_name") or study_config.study_name
+            effective_namespace = (
+                afsbox_cfg.get("namespace")
+                if (namespace == "default" and "namespace" in afsbox_cfg)
+                else namespace
+            )
+            effective_serving_name = serving_name or afsbox_cfg.get("serving_name")
+            effective_serving_template = afsbox_cfg.get("serving_template")
+            effective_cleanup_serving = cleanup_serving or afsbox_cfg.get("cleanup_serving", False)
+            deploy_timeout = afsbox_cfg.get("deploy_timeout_seconds", 1800)
+            poll_interval = afsbox_cfg.get("poll_interval_seconds", 10)
+
             execution_backend = AFSBoxK8sBackend(
                 tuning_name=effective_tuning_name,
-                namespace=namespace,
+                namespace=effective_namespace,
+                serving_name=effective_serving_name,
+                serving_template=effective_serving_template,
+                cleanup_serving=effective_cleanup_serving,
+                deploy_timeout_seconds=deploy_timeout,
+                poll_interval_seconds=poll_interval,
             )
             console.print(
-                f"[blue]Using AFSBox Kubernetes execution (ModelTuning: {effective_tuning_name}, Namespace: {namespace})[/blue]"
+                f"[blue]Using AFSBox Kubernetes execution (ModelTuning: {effective_tuning_name}, Serving: {execution_backend.serving_name}, Namespace: {effective_namespace})[/blue]"
             )
         else:
             console.print(
@@ -468,8 +495,10 @@ def display_optimization_results(controller: StudyController):
         table.add_column("Value", style="green")
 
         table.add_row("Total Trials", str(results["n_trials"]))
-        table.add_row("Best Value", f"{results['best_value']:.4f}")
-        table.add_row("Best Trial", str(results["best_trial_number"]))
+        best_val_str = f"{results['best_value']:.4f}" if results.get("best_value") is not None else "None"
+        best_trial_str = str(results["best_trial_number"]) if results.get("best_trial_number") is not None else "None"
+        table.add_row("Best Value", best_val_str)
+        table.add_row("Best Trial", best_trial_str)
 
         # Add baseline comparison if available
         if results.get("baseline_value") is not None:
@@ -849,7 +878,27 @@ def resume_command(
         "ray",
         "--backend",
         "-b",
-        help="Execution backend: 'ray' (only supported option)",
+        help="Execution backend: 'ray' or 'afsbox'",
+    ),
+    tuning_name: Optional[str] = typer.Option(
+        None,
+        "--tuning-name",
+        help="ModelTuning resource name (AFSBox backend only)",
+    ),
+    namespace: str = typer.Option(
+        "default",
+        "--namespace",
+        help="Kubernetes namespace (AFSBox backend only)",
+    ),
+    serving_name: Optional[str] = typer.Option(
+        None,
+        "--serving-name",
+        help="Existing ModelServing CR to patch (AFSBox backend only)",
+    ),
+    cleanup_serving: bool = typer.Option(
+        False,
+        "--cleanup-serving",
+        help="Delete experiment ModelServing CR when study completes (AFSBox backend only)",
     ),
     n_trials: Optional[int] = typer.Option(
         None, "--trials", "-n", help="Number of additional trials to run"
@@ -862,7 +911,7 @@ def resume_command(
     max_concurrent_trials: Optional[int] = typer.Option(
         None,
         "--max-concurrent-trials",
-        help="REQUIRED: Max concurrent trials to run simultaneously.",
+        help="Max concurrent trials to run simultaneously.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose logging"),
     start_ray_head: bool = typer.Option(
@@ -885,27 +934,28 @@ def resume_command(
     """Resume an existing optimization study. Fails if the study doesn't exist."""
     setup_logging(verbose)
 
-    # Validate Python environment options (exactly one should be specified)
-    python_env_options = [python_executable, venv_path, conda_env]
-    specified_options = [opt for opt in python_env_options if opt is not None]
+    if backend.lower() != "afsbox":
+        # Validate Python environment options (exactly one should be specified for Ray)
+        python_env_options = [python_executable, venv_path, conda_env]
+        specified_options = [opt for opt in python_env_options if opt is not None]
 
-    if len(specified_options) == 0:
-        console.print(
-            "[bold red]"
-            "Error: At least one Python environment option must be specified"
-            "[/bold red]"
-        )
-        console.print("Choose one of: --python-executable, --venv-path, or --conda-env")
-        raise typer.Exit(1)
+        if len(specified_options) == 0:
+            console.print(
+                "[bold red]"
+                "Error: At least one Python environment option must be specified"
+                "[/bold red]"
+            )
+            console.print("Choose one of: --python-executable, --venv-path, or --conda-env")
+            raise typer.Exit(1)
 
-    if len(specified_options) > 1:
-        console.print(
-            "[bold red]"
-            "Error: Only one Python environment option can be specified at a time"
-            "[/bold red]"
-        )
-        console.print("Choose one of: --python-executable, --venv-path, or --conda-env")
-        raise typer.Exit(1)
+        if len(specified_options) > 1:
+            console.print(
+                "[bold red]"
+                "Error: Only one Python environment option can be specified at a time"
+                "[/bold red]"
+            )
+            console.print("Choose one of: --python-executable, --venv-path, or --conda-env")
+            raise typer.Exit(1)
 
     console.print("[bold blue]Resuming auto-tune-vllm study[/bold blue]")
 
@@ -935,20 +985,38 @@ def resume_command(
                     "[/yellow]"
                 )
 
+        elif backend.lower() == "afsbox":
+            from ..execution.afsbox import AFSBoxK8sBackend
+
+            afsbox_cfg = getattr(study_config, "afsbox", None) or {}
+            effective_tuning_name = tuning_name or afsbox_cfg.get("tuning_name") or study_config.study_name
+            effective_namespace = (
+                afsbox_cfg.get("namespace")
+                if (namespace == "default" and "namespace" in afsbox_cfg)
+                else namespace
+            )
+            effective_serving_name = serving_name or afsbox_cfg.get("serving_name")
+            effective_serving_template = afsbox_cfg.get("serving_template")
+            effective_cleanup_serving = cleanup_serving or afsbox_cfg.get("cleanup_serving", False)
+            deploy_timeout = afsbox_cfg.get("deploy_timeout_seconds", 1800)
+            poll_interval = afsbox_cfg.get("poll_interval_seconds", 10)
+
+            execution_backend = AFSBoxK8sBackend(
+                tuning_name=effective_tuning_name,
+                namespace=effective_namespace,
+                serving_name=effective_serving_name,
+                serving_template=effective_serving_template,
+                cleanup_serving=effective_cleanup_serving,
+                deploy_timeout_seconds=deploy_timeout,
+                poll_interval_seconds=poll_interval,
+            )
+            console.print(
+                f"[blue]Using AFSBox Kubernetes execution (ModelTuning: {effective_tuning_name}, Serving: {execution_backend.serving_name}, Namespace: {effective_namespace})[/blue]"
+            )
+
         else:
             console.print(
-                "[bold red]"
-                "Error: Local execution backend is not supported in this version."
-                "[/bold red]"
-            )
-            console.print(
-                "[bold red]Only Ray distributed execution is available.[/bold red]"
-            )
-            console.print(
-                "[blue]Use --backend ray (default) or set up a Ray cluster.[/blue]"
-            )
-            console.print(
-                "[blue]See docs/ray_cluster_setup.md for Ray setup instructions.[/blue]"
+                f"[bold red]Error: Backend '{backend}' is not supported. Choose 'ray' or 'afsbox'.[/bold red]"
             )
             raise typer.Exit(1)
 
@@ -957,33 +1025,20 @@ def resume_command(
         final_max_concurrent_trials = (
             max_concurrent_trials or study_config.optimization.max_concurrent_trials
         )
-        if n_trials or n_total_trials:  # Only required if we will run new trials
-            if final_max_concurrent_trials is None:
-                console.print(
-                    "[bold red]"
-                    "❌ --max-concurrent-trials is required to resume "
-                    "with new trials"
-                    "[/bold red]"
-                )
-                console.print(
-                    "Set CLI flag or config: "
-                    "optimization.max_concurrent_trials"
-                )
-                raise typer.Exit(1)
-            if final_max_concurrent_trials < 1:
-                console.print(
-                    "[bold red]"
-                    "❌ --max-concurrent-trials must be >= 1"
-                    "[/bold red]"
-                )
-                raise typer.Exit(1)
-        resume_study_sync(
+        if final_max_concurrent_trials is None:
+            final_max_concurrent_trials = 1
+
+        controller = resume_study_sync(
             execution_backend,
             study_config,
             n_trials,
             n_total_trials,
             final_max_concurrent_trials,
         )
+
+        if backend.lower() == "afsbox" and hasattr(execution_backend, "sync_final_results_to_tuning"):
+            results = controller.get_optimization_results()
+            execution_backend.sync_final_results_to_tuning(results)
 
     except Exception as e:
         console.print(f"[bold red]Resume failed: {e}[/bold red]")
@@ -1026,13 +1081,6 @@ def resume_study_sync(
         console.print(f"Running {n_trials} additional trials...")
         controller.run_optimization(n_trials, max_concurrent_trials)
 
-        # Display updated results after running additional trials
-        console.print(
-            f"\n[bold green]Updated Study Results "
-            f"({len(controller.study.trials)} total trials)[/bold green]"
-        )
-        display_optimization_results(controller)
-
     elif n_total_trials is not None:
         # --total-trials specifies total trials to run
         if n_total_trials <= n_existing:
@@ -1052,18 +1100,29 @@ def resume_study_sync(
             )
             controller.run_optimization(trials_to_run, max_concurrent_trials)
 
-            # Display updated results after running additional trials
-            console.print(
-                f"\n[bold green]Final Study Results "
-                f"({len(controller.study.trials)} total trials)[/bold green]"
-            )
-            display_optimization_results(controller)
-
     else:
-        console.print(
-            "Study resumed. Use --trials to run additional trials or "
-            "--total-trials to set total trial count."
-        )
+        # Fallback to config optimization.n_trials
+        target_total = config.optimization.n_trials
+        if target_total <= n_existing:
+            console.print(
+                f"Study already has {n_existing} trials (target: {target_total}). "
+                f"No additional trials needed."
+            )
+        else:
+            trials_to_run = target_total - n_existing
+            console.print(
+                f"Resuming study: running {trials_to_run} more trials to reach total of "
+                f"{target_total} trials..."
+            )
+            controller.run_optimization(trials_to_run, max_concurrent_trials)
+
+    # Display updated results after running additional trials
+    console.print(
+        f"\n[bold green]Final Study Results "
+        f"({len(controller.study.trials)} total trials)[/bold green]"
+    )
+    display_optimization_results(controller)
+    return controller
 
 
 @app.command("validate")
