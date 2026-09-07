@@ -61,16 +61,23 @@ graph TB
 
 ---
 
-### 2.2 本專案系統層級與組件架構圖
+### 2.2 本專案系統層級與組件架構圖（含 --tuning-name 與 --config 雙軌讀取路徑）
 
-在目前分支中，`auto-tune-vllm` 是一個全自動的調優驅動者：
+在目前分支中，`auto-tune-vllm` 同時支援 **本機 YAML 設定檔讀取（`--config`）** 與 **Kubernetes CR 動態合成（`--tuning-name`）** 兩條明確的輸入路徑：
 
 ```mermaid
 graph TB
+    subgraph Inputs["參數來源雙軌分支 (CLI Input Options)"]
+        OptConfig["【分支 A】--config <yaml-path><br/>(本機研發 / 離線自訂調優)"]
+        OptTuning["【分支 B】--tuning-name <cr-name><br/>(Portal 發起 / 雲原生整合)"]
+        LocalFile["本機 YAML 設定檔<br/>(study_config.yaml)"]
+    end
+
     subgraph TunerRunner["auto-tune-vllm : Runner 容器內部組件"]
-        CLI["CLI 進入點 (main.py)<br/>--backend afsbox --tuning-name <cr>"]
+        CLI["CLI 進入點 (main.py)<br/>optimize --backend afsbox"]
+        Parser["YAML 解析器 (config.py)<br/>解析 parameters / objectives"]
+        Synthesizer["CR 配置合成器 (afsbox.py)<br/>synthesize_study_config_from_cr()"]
         StudyCtrl["StudyController<br/>(Optuna 搜尋迴圈排程器)"]
-        Synthesizer["CR 配置合成器 (config.py)<br/>將 ModelTuning 轉為 Optuna 設定檔"]
         Backend["AFSBoxK8sBackend (afsbox.py)<br/>實作 ExecutionBackend 介面"]
         K8sClient["K8s Python Client<br/>CustomObjectsApi"]
     end
@@ -88,9 +95,20 @@ graph TB
         AIPerfPod["AIPerf 壓測容器 Pod<br/>(產生高並發合成負載)"]
     end
 
-    CLI --> Synthesizer
-    Synthesizer -->|"1. 讀取調校規格"| CR_Tuning
-    CLI --> StudyCtrl
+    OptConfig --> CLI
+    OptTuning --> CLI
+
+    %% 分支 A 流程 (本地檔案)
+    LocalFile -->|"讀取檔案"| Parser
+    CLI -->|"使用 --config"| Parser
+    Parser -->|"載入 StudyConfig"| StudyCtrl
+
+    %% 分支 B 流程 (CRD 動態合成)
+    CLI -->|"使用 --tuning-name"| Synthesizer
+    Synthesizer -->|"1. 遠端查詢 ModelTuning CR"| CR_Tuning
+    Synthesizer -->|"在記憶體動態合成 StudyConfig"| StudyCtrl
+
+    %% 調優迴圈與執行
     StudyCtrl --> Backend
     Backend --> K8sClient
 
@@ -123,11 +141,16 @@ sequenceDiagram
     participant Serving as vLLM Serving Pod
     participant Bench as AIPerf 壓測 Pod
 
-    Note over Portal, K8s: 階段 1：任務建立與配置合成
-    Portal->>K8s: 建立 ModelTuning CR (指定模型、搜尋空間、最佳化目標)
-    Runner->>K8s: GET ModelTuning CR (讀取 --tuning-name)
-    K8s-->>Runner: 回傳 CR Spec
-    Runner->>Runner: 自動合成 Optuna 配置（動態調整 n_startup_trials、Baseline 參數）
+    Note over Portal, K8s: 階段 1：任務建立與配置讀取（雙軌）
+    alt 模式一：CR 驅動模式（--tuning-name <cr>）
+        Portal->>K8s: 建立 ModelTuning CR (指定模型、搜尋空間、最佳化目標)
+        Runner->>K8s: GET ModelTuning CR (依據 --tuning-name 遠端查詢)
+        K8s-->>Runner: 回傳 CR Spec 規格
+        Runner->>Runner: 自動在記憶體合成 Optuna 配置與 Baseline 參數
+    else 模式二：CLI 模式（--config <yaml>）
+        Portal->>Runner: 傳入本機 --config study_config.yaml
+        Runner->>Runner: 直接解析本地 YAML 檔案獲取搜尋空間與目標
+    end
 
     Note over Runner, Serving: 階段 2：實驗 Serving 建立與 Ready 判定
     Runner->>K8s: POST ModelServing (<name>-exp)
