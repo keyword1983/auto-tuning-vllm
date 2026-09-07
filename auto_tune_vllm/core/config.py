@@ -292,6 +292,7 @@ class StudyConfig:
     )
     constraints: list[Constraint] = field(default_factory=list)
     afsbox: Optional[Dict[str, Any]] = None  # AFSBox Kubernetes configuration and serving template
+    engine: str = "vllm"  # Serving engine: "vllm", "sglang", "llamacpp"
 
     @classmethod
     def from_file(
@@ -591,6 +592,13 @@ class ConfigValidator:
                     raise TypeError(msg)
                 constraints = [Constraint(expression=expr) for expr in constraint_data]
 
+        # Detect engine from raw_config root or afsbox.serving_template
+        engine = raw_config.get("engine")
+        if not engine and "afsbox" in raw_config and isinstance(raw_config["afsbox"], dict):
+            engine = raw_config["afsbox"].get("serving_template", {}).get("engine", {}).get("type")
+        if not engine:
+            engine = "vllm"
+
         return StudyConfig(
             study_name=study_name,
             database_url=database_url,
@@ -606,6 +614,7 @@ class ConfigValidator:
             use_explicit_name=use_explicit_name,
             constraints=constraints,
             afsbox=raw_config.get("afsbox"),
+            engine=str(engine),
         )
 
     def _infer_parameter_type(self, parameter_config: dict[str, Any]):

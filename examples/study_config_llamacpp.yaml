@@ -1,0 +1,67 @@
+# Example study configuration for llama.cpp serving tuning on AFSBox
+study:
+  name: llamacpp_optuna_tuning
+  storage_file: ./optuna_studies/llamacpp_optuna_tuning/study.db
+
+engine: llamacpp
+backend: afsbox
+
+afsbox:
+  namespace: afsbox-tokenfactory
+  serving_name: llamacpp-tuning-exp
+  cleanup_serving: true
+  deploy_timeout_seconds: 300
+  poll_interval_seconds: 5
+  serving_template:
+    image: ghcr.io/ggerganov/llama.cpp:server
+    modelType: llm
+    servedModelName: llama3-8b-gguf
+    model:
+      valueFrom:
+        kind: ClusterModelRepository
+        name: llama3-8b-gguf
+    replicas: 1
+    batchSize: "8"
+    contextLength: "4096"
+    command:
+      - /llama-server
+      - -m
+      - /models/afsbox/llama3/8b-q4_k_m.gguf
+      - --alias=llama3-8b-gguf
+      - --port=8080
+    engine:
+      type: llamacpp
+      servicePort: 8080
+
+optimization:
+  approach: multi_objective
+  sampler: tpe
+  n_trials: 10
+  n_startup_trials: 2
+  max_concurrent_trials: 1
+  objectives:
+    - metric: output_tokens_per_second
+      direction: maximize
+    - metric: time_to_first_token_ms
+      direction: minimize
+      percentile: p50
+
+benchmark:
+  benchmark_type: aiperf
+  model: llama3-8b-gguf
+  samples: 20
+  rate: 4
+  prompt_tokens: 64
+  output_tokens: 32
+  max_seconds: 120
+
+parameters:
+  batch_size:
+    enabled: true
+    options: [2, 4, 8, 16]
+  threads:
+    enabled: true
+    options: [4, 8, 16]
+  ubatch_size:
+    enabled: true
+    options: [128, 256, 512]

@@ -277,6 +277,8 @@ def optimize_command(
             deploy_timeout = afsbox_cfg.get("deploy_timeout_seconds", 1800)
             poll_interval = afsbox_cfg.get("poll_interval_seconds", 10)
 
+            effective_engine = getattr(study_config, "engine", None)
+
             execution_backend = AFSBoxK8sBackend(
                 tuning_name=effective_tuning_name,
                 namespace=effective_namespace,
@@ -285,9 +287,10 @@ def optimize_command(
                 cleanup_serving=effective_cleanup_serving,
                 deploy_timeout_seconds=deploy_timeout,
                 poll_interval_seconds=poll_interval,
+                engine=effective_engine,
             )
             console.print(
-                f"[blue]Using AFSBox Kubernetes execution (ModelTuning: {effective_tuning_name}, Serving: {execution_backend.serving_name}, Namespace: {effective_namespace})[/blue]"
+                f"[blue]Using AFSBox Kubernetes execution (Engine: {execution_backend.engine_adapter.name}, ModelTuning: {effective_tuning_name}, Serving: {execution_backend.serving_name}, Namespace: {effective_namespace})[/blue]"
             )
         else:
             console.print(

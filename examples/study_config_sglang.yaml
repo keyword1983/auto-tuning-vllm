@@ -1,0 +1,80 @@
+# Example study configuration for SGLang serving tuning on AFSBox
+study:
+  name: sglang_optuna_tuning
+  storage_file: ./optuna_studies/sglang_optuna_tuning/study.db
+
+engine: sglang
+backend: afsbox
+
+afsbox:
+  namespace: afsbox-tokenfactory
+  serving_name: sglang-tuning-exp
+  cleanup_serving: true
+  deploy_timeout_seconds: 300
+  poll_interval_seconds: 5
+  serving_template:
+    image: docker.io/lmsysorg/sglang:latest
+    modelType: llm
+    servedModelName: qwen-7b
+    model:
+      valueFrom:
+        kind: ClusterModelRepository
+        name: qwen-7b
+    gpuClaim:
+      className: nvidia-gb10
+      requests:
+        memoryMB: 16384
+    replicas: 1
+    parallelism:
+      tp: 1
+    batchSize: "32"
+    gpuMemoryUtilization: "0.8"
+    contextLength: "4096"
+    command:
+      - python3
+      - -m
+      - sglang.launch_server
+      - --model-path=/models/afsbox/qwen/qwen-7b/latest
+      - --served-model-name=qwen-7b
+      - --port=30000
+    engine:
+      type: sglang
+      servicePort: 30000
+
+optimization:
+  approach: multi_objective
+  sampler: tpe
+  n_trials: 10
+  n_startup_trials: 2
+  max_concurrent_trials: 1
+  objectives:
+    - metric: output_tokens_per_second
+      direction: maximize
+    - metric: time_to_first_token_ms
+      direction: minimize
+      percentile: p50
+
+benchmark:
+  benchmark_type: aiperf
+  model: qwen-7b
+  samples: 20
+  rate: 4
+  prompt_tokens: 64
+  output_tokens: 32
+  max_seconds: 120
+
+parameters:
+  batch_size:
+    enabled: true
+    options: [16, 32, 64]
+  gpu_memory_utilization:
+    enabled: true
+    min: 0.70
+    max: 0.85
+    step: 0.05
+  chunked_prefill_size:
+    enabled: true
+    options: [512, 1024, 2048]
+  schedule_policy:
+    enabled: true
+    options: [lpm, fcfs]

@@ -12,6 +12,8 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..core.trial import ExecutionInfo, TrialConfig, TrialResult
+from ..engines.base import EngineAdapter
+from ..engines.factory import get_engine_adapter
 from .backends import ExecutionBackend, JobHandle
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
         cleanup_serving: bool = False,
         deploy_timeout_seconds: int = 1800,
         poll_interval_seconds: int = 10,
+        engine: Optional[str] = None,
     ):
         """Initialize AFSBox Kubernetes execution backend.
 
@@ -61,6 +64,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
             cleanup_serving: Whether to delete the ModelServing CR upon study completion.
             deploy_timeout_seconds: Max seconds to wait for ModelServing to become Ready after patch.
             poll_interval_seconds: Interval between status polls.
+            engine: Inference serving engine type ('vllm', 'sglang', 'llamacpp').
         """
         self.tuning_name = tuning_name
         self.namespace = namespace
@@ -77,6 +81,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
         self._cached_tuning_test_suite: Optional[List[Dict[str, Any]]] = None
         self._serving_created_by_us: bool = False
         self._serving_just_created: bool = False
+        self._engine_adapter: Optional[EngineAdapter] = get_engine_adapter(engine) if engine else None
 
         # Lazy load kubernetes client to avoid import errors when running in environments without it
         try:
@@ -97,6 +102,29 @@ class AFSBoxK8sBackend(ExecutionBackend):
             )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize Kubernetes client for AFSBox backend: {e}")
+
+    @property
+    def engine_adapter(self) -> EngineAdapter:
+        """Get or lazily initialize the engine adapter for this session."""
+        if self._engine_adapter is not None:
+            return self._engine_adapter
+
+        engine_type = None
+        if self.serving_template and isinstance(self.serving_template, dict):
+            engine_type = self.serving_template.get("engine", {}).get("type")
+
+        if not engine_type:
+            spec = self._get_parent_tuning_spec()
+            if spec:
+                engine_type = spec.get("servingTemplate", {}).get("engine", {}).get("type")
+
+        self._engine_adapter = get_engine_adapter(engine_type)
+        logger.info(
+            "Configured AFSBox backend with engine adapter: %s (default port: %d)",
+            self._engine_adapter.name,
+            self._engine_adapter.default_port,
+        )
+        return self._engine_adapter
 
     def _get_parent_tuning_cr(self) -> Optional[Dict[str, Any]]:
         """Fetch parent ModelTuning CR if available."""
@@ -375,60 +403,8 @@ class AFSBoxK8sBackend(ExecutionBackend):
                 raise RuntimeError(f"AFSBox ModelServing creation failed: {e}")
 
     def _map_parameters_to_serving_patch(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Map Optuna parameter dictionary to AFSBox ModelServing spec patch.
-
-        Handles parallelism (TP/PP), memory utilization, batch size, context length,
-        and generic CLI extraArgs.
-        """
-        spec_patch: Dict[str, Any] = {}
-        parallelism: Dict[str, Any] = {}
-        extra_args: List[str] = []
-
-        for k, v in params.items():
-            k_lower = k.lower().replace("-", "_")
-
-            # Typed top-level fields
-            if k_lower in ("batchsize", "batch_size", "max_num_seqs"):
-                spec_patch["batchSize"] = str(v)
-            elif k_lower in ("contextlength", "context_length", "max_model_len"):
-                spec_patch["contextLength"] = str(v)
-            elif k_lower in ("replicas", "replica_count"):
-                spec_patch["replicas"] = int(v)
-
-            # Parallelism
-            elif k_lower in ("tp", "tensor_parallel_size"):
-                parallelism["tp"] = int(v)
-            elif k_lower in ("pp", "pipeline_parallel_size"):
-                parallelism["pp"] = int(v)
-            elif k_lower in ("dp", "data_parallel_size"):
-                parallelism["dp"] = int(v)
-
-            # GPU & Memory
-            elif k_lower in ("gpu_memory_utilization", "gpu_mem_util"):
-                spec_patch["gpuMemoryUtilization"] = str(v)
-            elif k_lower in ("max_num_batched_tokens",):
-                if "prefillSettings" not in spec_patch:
-                    spec_patch["prefillSettings"] = {}
-                spec_patch["prefillSettings"]["maxBatchTokens"] = str(v)
-            elif k_lower in ("kv_cache_dtype",):
-                spec_patch["kvCacheDtype"] = str(v)
-            elif k_lower in ("enable_cuda_graphs", "cuda_graph"):
-                if isinstance(v, bool):
-                    spec_patch["cudaGraph"] = {"enabled": v}
-
-            # Direct values / params dot-path
-            elif k.startswith("values.") or k.startswith("params."):
-                extra_args.append(f"--{k}={v}")
-            else:
-                extra_args.append(f"--{k.replace('_', '-')}={v}")
-
-        if parallelism:
-            spec_patch["parallelism"] = parallelism
-
-        if extra_args:
-            spec_patch["extraCommand"] = extra_args
-
-        return spec_patch
+        """Map Optuna parameter dictionary to AFSBox ModelServing spec patch using engine adapter."""
+        return self.engine_adapter.map_to_serving_patch(params)
 
     def submit_trial(self, trial_config: TrialConfig) -> JobHandle:
         """Submit a trial to AFSBox by updating ModelServing and triggering a Benchmark CR."""
@@ -534,6 +510,14 @@ class AFSBoxK8sBackend(ExecutionBackend):
         else:
             endpoint_model = "opt-125m"
 
+        service_port = self.engine_adapter.default_port
+        if self.serving_template and isinstance(self.serving_template, dict):
+            service_port = self.serving_template.get("engine", {}).get("servicePort", service_port)
+        else:
+            parent_spec = self._get_parent_tuning_spec()
+            if parent_spec and isinstance(parent_spec, dict):
+                service_port = parent_spec.get("servingTemplate", {}).get("engine", {}).get("servicePort", service_port)
+
         bench_body = {
             "apiVersion": f"{AFSBOX_GROUP}/{AFSBOX_VERSION}",
             "kind": "Benchmark",
@@ -550,7 +534,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
                 "target": {
                     "modelServingRef": {"name": serving_name},
                     "endpoint": {
-                        "url": f"http://{serving_name}.{self.namespace}.svc.cluster.local:8000/v1",
+                        "url": f"http://{serving_name}.{self.namespace}.svc.cluster.local:{service_port}/v1",
                         "modelName": endpoint_model,
                     },
                 },
@@ -1031,39 +1015,24 @@ def synthesize_study_config_from_cr(tuning_name: str, namespace: str = "default"
         "max_seconds": test_suite[0].get("timeoutSeconds", 60) if test_suite else 60,
     }
 
-    # Safe default parameters for vLLM single-GPU deployment
-    params_dict = {
-        "batch_size": {
-            "enabled": True,
-            "options": [8, 16, 32, 64],
-        },
-        "gpu_memory_utilization": {
-            "enabled": True,
-            "min": 0.65,
-            "max": 0.85,
-            "step": 0.05,
-        },
-    }
+    # Detect engine type and get adapter
+    engine_type = serving_template.get("engine", {}).get("type") if isinstance(serving_template, dict) else None
+    engine_adapter = get_engine_adapter(engine_type)
+    logger.info("Synthesizing study config using engine adapter: %s", engine_adapter.name)
+
+    # Default parameters tailored to the engine
+    params_dict = engine_adapter.get_default_parameter_space()
 
     n_trials = opt_spec.get("nTrials", 20)
     n_startup = max(1, min(5, n_trials - 1)) if n_trials > 1 else 1
 
-    baseline_params = {}
-    if "batchSize" in serving_template:
-        try:
-            baseline_params["batch_size"] = int(serving_template["batchSize"])
-        except (ValueError, TypeError):
-            pass
-    if "gpuMemoryUtilization" in serving_template:
-        try:
-            baseline_params["gpu_memory_utilization"] = float(serving_template["gpuMemoryUtilization"])
-        except (ValueError, TypeError):
-            pass
+    baseline_params = engine_adapter.extract_baseline_parameters(serving_template)
 
     study_dict = {
         "study": {
             "name": tuning_name,
         },
+        "engine": engine_adapter.name,
         "backend": "afsbox",
         "afsbox": {
             "namespace": namespace,
