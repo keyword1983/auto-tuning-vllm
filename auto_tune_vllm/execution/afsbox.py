@@ -217,14 +217,20 @@ class AFSBoxK8sBackend(ExecutionBackend):
         """Ensure experiment ModelServing CR exists in Kubernetes; create it if not present."""
         serving_name = self.serving_name
         try:
-            self.custom_api.get_namespaced_custom_object(
+            existing = self.custom_api.get_namespaced_custom_object(
                 group=AFSBOX_GROUP,
                 version=AFSBOX_VERSION,
                 namespace=self.namespace,
                 plural=PLURAL_SERVINGS,
                 name=serving_name,
             )
-            logger.info("Target ModelServing %s already exists in %s", serving_name, self.namespace)
+            labels = existing.get("metadata", {}).get("labels", {})
+            if (
+                labels.get("app.kubernetes.io/managed-by") == "auto-tuning-vllm"
+                or (self.tuning_name and labels.get(LABEL_TUNING) == self.tuning_name)
+            ):
+                self._serving_created_by_us = True
+            logger.info("Target ModelServing %s already exists in %s (managed_by_us=%s)", serving_name, self.namespace, self._serving_created_by_us)
             return
         except Exception as e:
             from kubernetes.client.exceptions import ApiException
@@ -866,7 +872,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
 
     def shutdown(self):
         """Clean shutdown of backend resources."""
-        if self.cleanup_serving and self._serving_created_by_us:
+        if self.cleanup_serving and (self._serving_created_by_us or self.tuning_name):
             self._delete_serving()
         logger.info("AFSBoxK8sBackend shutdown completed.")
 
@@ -874,13 +880,11 @@ class AFSBoxK8sBackend(ExecutionBackend):
         """Clean up active benchmarks and experiment serving if configured."""
         logger.info("Cleaning up active trials for AFSBox backend.")
         self.active_trials.clear()
-        if self.cleanup_serving and self._serving_created_by_us:
+        if self.cleanup_serving and (self._serving_created_by_us or self.tuning_name):
             self._delete_serving()
 
     def _delete_serving(self):
         """Delete experiment ModelServing CR if created by this backend."""
-        if not self._serving_created_by_us:
-            return
         serving_name = self._get_experiment_serving_name()
         try:
             logger.info("Deleting ModelServing %s in namespace %s...", serving_name, self.namespace)
@@ -920,6 +924,7 @@ def synthesize_study_config_from_cr(tuning_name: str, namespace: str = "default"
     spec = tuning_obj.get("spec", {})
     opt_spec = spec.get("optimization", {}) or {}
     test_suite = spec.get("testSuite", [])
+    serving_template = spec.get("servingTemplate", {})
 
     objectives = []
     for obj in opt_spec.get("objectives", []):
@@ -934,36 +939,43 @@ def synthesize_study_config_from_cr(tuning_name: str, namespace: str = "default"
             {"metric": "time_to_first_token_ms", "direction": "minimize"},
         ]
 
+    # Extract servedModelName from servingTemplate
+    served_model_name = (
+        serving_template.get("servedModelName")
+        or serving_template.get("model", {}).get("valueFrom", {}).get("name")
+        or "default"
+    )
+
     suite_params = test_suite[0].get("params", {}) if test_suite else {}
     isl = suite_params.get("isl", {})
     osl = suite_params.get("osl", {})
     bench_dict = {
         "benchmark_type": "aiperf",
-        "model": spec.get("servingTemplate", {}).get("model", {}).get("uri", "default"),
-        "samples": suite_params.get("requestCount", 100),
-        "rate": suite_params.get("concurrency", 8),
-        "prompt_tokens": isl.get("mean", 1000) if isinstance(isl, dict) else 1000,
-        "output_tokens": osl.get("mean", 1000) if isinstance(osl, dict) else 1000,
+        "model": served_model_name,
+        "samples": suite_params.get("requestCount", 10),
+        "rate": suite_params.get("concurrency", 4),
+        "prompt_tokens": isl.get("mean", 64) if isinstance(isl, dict) else 64,
+        "output_tokens": osl.get("mean", 32) if isinstance(osl, dict) else 32,
         "dataset": suite_params.get("dataset"),
-        "max_seconds": test_suite[0].get("timeoutSeconds", 300) if test_suite else 300,
+        "max_seconds": test_suite[0].get("timeoutSeconds", 60) if test_suite else 60,
     }
 
+    # Safe default parameters for vLLM single-GPU deployment
     params_dict = {
-        "tensor_parallel_size": {
+        "batch_size": {
             "enabled": True,
-            "options": [1, 2],
-        },
-        "max_num_batched_tokens": {
-            "enabled": True,
-            "options": [2048, 4096, 8192],
+            "options": [8, 16, 32, 64],
         },
         "gpu_memory_utilization": {
             "enabled": True,
-            "min": 0.8,
-            "max": 0.95,
+            "min": 0.65,
+            "max": 0.85,
             "step": 0.05,
         },
     }
+
+    n_trials = opt_spec.get("nTrials", 20)
+    n_startup = max(1, min(5, n_trials - 1)) if n_trials > 1 else 1
 
     study_dict = {
         "study": {
@@ -973,12 +985,18 @@ def synthesize_study_config_from_cr(tuning_name: str, namespace: str = "default"
         "afsbox": {
             "namespace": namespace,
             "tuning_name": tuning_name,
+            "serving_name": f"{tuning_name}-exp",
+            "serving_template": serving_template,
+            "cleanup_serving": True,
+            "deploy_timeout_seconds": 300,
+            "poll_interval_seconds": 5,
         },
         "optimization": {
             "approach": "multi_objective" if len(objectives) > 1 else "single_objective",
             "objectives": objectives,
-            "sampler": opt_spec.get("sampler", "nsga2" if len(objectives) > 1 else "tpe"),
-            "n_trials": opt_spec.get("nTrials", 20),
+            "sampler": opt_spec.get("sampler", "tpe"),
+            "n_trials": n_trials,
+            "n_startup_trials": n_startup,
             "max_concurrent_trials": 1,
         },
         "benchmark": bench_dict,
@@ -988,6 +1006,6 @@ def synthesize_study_config_from_cr(tuning_name: str, namespace: str = "default"
     tmp_file = tempfile.NamedTemporaryFile(mode="w", suffix=f"_{tuning_name}.yaml", delete=False)
     yaml.safe_dump(study_dict, tmp_file, sort_keys=False)
     tmp_file.close()
-    logger.info("Synthesized study configuration from ModelTuning CR: %s", tmp_file.name)
+    logger.info("Synthesized study configuration from ModelTuning CR %s: %s", tuning_name, tmp_file.name)
     return tmp_file.name
 
