@@ -583,6 +583,27 @@ class AFSBoxK8sBackend(ExecutionBackend):
             "exec_info": exec_info,
             "trial_config": trial_config,
         }
+
+        # Update candidate status to Testing with parameters
+        candidate_vars = dict(trial_config.parameters) if trial_config.parameters else {}
+        if not candidate_vars and trial_config.trial_type == "baseline" and self.serving_template:
+            if "batchSize" in self.serving_template:
+                try:
+                    candidate_vars["batch_size"] = int(self.serving_template["batchSize"])
+                except (ValueError, TypeError):
+                    pass
+            if "gpuMemoryUtilization" in self.serving_template:
+                try:
+                    candidate_vars["gpu_memory_utilization"] = float(self.serving_template["gpuMemoryUtilization"])
+                except (ValueError, TypeError):
+                    pass
+        self._sync_candidate_status_to_tuning(
+            candidate_name=trial_id,
+            bench_name=bench_name,
+            phase="Testing",
+            variables=candidate_vars,
+        )
+
         return handle
 
     def poll_trials(
@@ -644,6 +665,28 @@ class AFSBoxK8sBackend(ExecutionBackend):
                         detailed_metrics, trial_config.optimization_config
                     )
 
+                    # Format metrics dictionary for CR status (all values formatted as strings)
+                    metrics_str_map: Dict[str, str] = {}
+                    for k, v in detailed_metrics.items():
+                        if isinstance(v, float):
+                            metrics_str_map[k] = f"{v:.4f}"
+                        elif isinstance(v, (int, str)):
+                            metrics_str_map[k] = str(v)
+
+                    # Extract candidate parameters/variables
+                    candidate_vars = dict(trial_config.parameters) if trial_config.parameters else {}
+                    if not candidate_vars and trial_config.trial_type == "baseline" and self.serving_template:
+                        if "batchSize" in self.serving_template:
+                            try:
+                                candidate_vars["batch_size"] = int(self.serving_template["batchSize"])
+                            except (ValueError, TypeError):
+                                pass
+                        if "gpuMemoryUtilization" in self.serving_template:
+                            try:
+                                candidate_vars["gpu_memory_utilization"] = float(self.serving_template["gpuMemoryUtilization"])
+                            except (ValueError, TypeError):
+                                pass
+
                     result = TrialResult(
                         trial_id=trial_id,
                         trial_number=trial_config.trial_number,
@@ -654,12 +697,19 @@ class AFSBoxK8sBackend(ExecutionBackend):
                         success=True,
                     )
                     completed_results.append(result)
-                    self._sync_candidate_status_to_tuning(trial_id, bench_name, "Completed")
+                    self._sync_candidate_status_to_tuning(
+                        candidate_name=trial_id,
+                        bench_name=bench_name,
+                        phase="Completed",
+                        variables=candidate_vars,
+                        metrics=metrics_str_map,
+                    )
                     logger.info("Trial %s Benchmark %s completed: %s", trial_id, bench_name, objective_values)
 
                 elif phase == "Failed":
                     exec_info.mark_completed("failed")
                     err_msg = status.get("message", "Benchmark failed")
+                    candidate_vars = dict(trial_config.parameters) if trial_config.parameters else {}
                     result = TrialResult(
                         trial_id=trial_id,
                         trial_number=trial_config.trial_number,
@@ -670,7 +720,13 @@ class AFSBoxK8sBackend(ExecutionBackend):
                         error_message=err_msg,
                     )
                     completed_results.append(result)
-                    self._sync_candidate_status_to_tuning(trial_id, bench_name, "Failed", err_msg)
+                    self._sync_candidate_status_to_tuning(
+                        candidate_name=trial_id,
+                        bench_name=bench_name,
+                        phase="Failed",
+                        message=err_msg,
+                        variables=candidate_vars,
+                    )
                     logger.warning("Trial %s Benchmark %s failed: %s", trial_id, bench_name, err_msg)
 
                 else:
@@ -683,7 +739,13 @@ class AFSBoxK8sBackend(ExecutionBackend):
         return completed_results, remaining_handles
 
     def _sync_candidate_status_to_tuning(
-        self, candidate_name: str, bench_name: str, phase: str, message: str = ""
+        self,
+        candidate_name: str,
+        bench_name: str,
+        phase: str,
+        message: str = "",
+        variables: Optional[Dict[str, Any]] = None,
+        metrics: Optional[Dict[str, str]] = None,
     ):
         """Sync trial candidate progress back to parent ModelTuning.status.candidates."""
         if not self.tuning_name:
@@ -706,18 +768,27 @@ class AFSBoxK8sBackend(ExecutionBackend):
                     c["benchmarkRef"] = bench_name
                     if message:
                         c["message"] = message
+                    if variables:
+                        c["variables"] = variables
+                    if metrics:
+                        c["metrics"] = metrics
                     found = True
                     break
             if not found:
-                candidates.append({
+                item = {
                     "name": candidate_name,
                     "benchmarkRef": bench_name,
                     "phase": phase,
                     "message": message,
-                })
+                }
+                if variables:
+                    item["variables"] = variables
+                if metrics:
+                    item["metrics"] = metrics
+                candidates.append(item)
 
             status["candidates"] = candidates
-            status["currentCandidate"] = candidate_name
+            status["currentCandidate"] = candidate_name if phase not in ("Completed", "Failed") else ""
             self.custom_api.patch_namespaced_custom_object_status(
                 group=AFSBOX_GROUP,
                 version=AFSBOX_VERSION,
@@ -977,6 +1048,18 @@ def synthesize_study_config_from_cr(tuning_name: str, namespace: str = "default"
     n_trials = opt_spec.get("nTrials", 20)
     n_startup = max(1, min(5, n_trials - 1)) if n_trials > 1 else 1
 
+    baseline_params = {}
+    if "batchSize" in serving_template:
+        try:
+            baseline_params["batch_size"] = int(serving_template["batchSize"])
+        except (ValueError, TypeError):
+            pass
+    if "gpuMemoryUtilization" in serving_template:
+        try:
+            baseline_params["gpu_memory_utilization"] = float(serving_template["gpuMemoryUtilization"])
+        except (ValueError, TypeError):
+            pass
+
     study_dict = {
         "study": {
             "name": tuning_name,
@@ -990,6 +1073,11 @@ def synthesize_study_config_from_cr(tuning_name: str, namespace: str = "default"
             "cleanup_serving": True,
             "deploy_timeout_seconds": 300,
             "poll_interval_seconds": 5,
+        },
+        "baseline": {
+            "enabled": True,
+            "concurrency_levels": [bench_dict["rate"]],
+            "parameters": baseline_params,
         },
         "optimization": {
             "approach": "multi_objective" if len(objectives) > 1 else "single_objective",

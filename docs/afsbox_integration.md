@@ -400,4 +400,239 @@ controllerManager:
 關於 AFSBox 跨引擎抽象架構分析、各引擎通用欄位映射表、AIPerf 評測協議相容性與多引擎調優完整設計方案，請參閱獨立設計文檔：
 - [AFSBox 多推論引擎調優支援架構設計 (vLLM, SGLang, llama.cpp)](file:///mnt/d/work/ai-workspace/auto-tuning-vllm/docs/multi_engine_support_design.md)
 
+---
+
+## 十三、兩種執行模式與實戰操作指南（Execution Modes & Operational Guide）
+
+`auto-tune-vllm` 提供兩種核心執行模式，分別針對 **「本機研發與自訂調優」** 與 **「雲原生 Portal / CR 整合調優」**：
+
+### 13.1 模式比較矩陣
+
+| 比較維度 | 模式一：CLI 模式（獨立 Config 驅動） | 模式二：CR 驅動模式（ModelTuning CR 整合） |
+| :--- | :--- | :--- |
+| **核心旗標** | `--config <yaml-path>` | `--tuning-name <cr-name> [--namespace <ns>]` |
+| **參數來源** | 本機 YAML 檔案（手動指定搜尋空間、目標與壓測） | Kubernetes `ModelTuning` CR（由 Runner 自動讀取並合成） |
+| **搜尋空間與目標** | 完全自由自訂（支援高級 Optuna 設定、多層階梯） | 自動從 `spec.optimization`、`servingTemplate` 與 `testSuite` 萃取 |
+| **適用情境** | 演算法研發、本機/單機測試、離線批次調優、精細微調 | AFSBox Portal UI 一鍵發起、Controller 委派 Job、端到端自動化 |
+| **狀態回寫 (Status Sync)** | 僅記錄於本機 SQLite 資料庫（`study.db`）與終端機輸出 | 即時同步至 `ModelTuning.status`（含 `variables`, `metrics`, `paretoFrontier`） |
+| **Serving 生命週期** | 可指向既有 Serving 或自動建立 | 自動依 CR 規格建立 `<tuning_name>-exp`，完工後自動刪除釋放 GPU |
+
+---
+
+### 13.2 模式一：CLI 模式（獨立 Config 驅動）
+
+適用於研發階段直接測試不同演算法或特定模型，不依賴 AFSBox Portal 或 `ModelTuning` CR。
+
+#### 1. 配置範例 (`study_config.yaml`)
+```yaml
+study:
+  name: opt125m_cli_tpe
+backend: afsbox
+afsbox:
+  namespace: afsbox-tokenfactory
+  serving_name: opt125m-cli-exp
+  serving_template:
+    image: "docker.io/vllm/vllm-openai:v0.27.1"
+    servedModelName: opt-125m
+    model:
+      valueFrom:
+        kind: ClusterModelRepository
+        name: facebook-opt-125m
+    gpuClaim:
+      className: nvidia-gb10
+      requests:
+        memoryMB: 16384
+  cleanup_serving: true
+
+optimization:
+  approach: multi_objective
+  sampler: tpe
+  n_trials: 10
+  objectives:
+    - metric: output_tokens_per_second
+      direction: maximize
+    - metric: time_to_first_token_ms
+      direction: minimize
+
+benchmark:
+  benchmark_type: aiperf
+  model: opt-125m
+  samples: 10
+  rate: 4
+
+parameters:
+  batch_size:
+    enabled: true
+    options: [8, 16, 32, 64]
+  gpu_memory_utilization:
+    enabled: true
+    min: 0.65
+    max: 0.85
+    step: 0.05
+```
+
+#### 2. 本機 Python 執行
+```bash
+auto-tune-vllm optimize \
+  --backend afsbox \
+  --config ./study_config.yaml \
+  --verbose
+```
+
+#### 3. Docker 容器執行
+```bash
+sudo docker run --rm --net=host \
+  --entrypoint auto-tune-vllm \
+  -v /etc/rancher/k3s/k3s.yaml:/root/.kube/config:ro \
+  -v $(pwd)/study_config.yaml:/app/config.yaml:ro \
+  -v /tmp/optuna_studies:/app/optuna_studies \
+  keyword1983/auto-tune-vllm:runner \
+  optimize \
+    --backend afsbox \
+    --config /app/config.yaml \
+    --verbose
+```
+
+---
+
+### 13.3 模式二：CR 驅動模式（ModelTuning CR 整合）
+
+適用於由 AFSBox Portal 觸發或透過 Kubernetes 原生宣告式管理的調校任務。
+
+#### 1. ModelTuning CR 定義範例 (`opt125m-cr.yaml`)
+```yaml
+apiVersion: afsbox.asus.com/v1beta1
+kind: ModelTuning
+metadata:
+  name: opt125m-cr-test
+  namespace: afsbox-tokenfactory
+spec:
+  displayName: "OPT-125M Auto Tuning"
+  servingTemplate:
+    image: "docker.io/vllm/vllm-openai:v0.27.1"
+    engine:
+      servicePort: 8000
+      type: vllm
+    servedModelName: opt-125m
+    model:
+      valueFrom:
+        kind: ClusterModelRepository
+        name: facebook-opt-125m
+    gpuClaim:
+      className: nvidia-gb10
+      requests:
+        memoryMB: 16384
+    batchSize: "32"
+    gpuMemoryUtilization: "0.8"
+  optimization:
+    engine: "optuna"
+    approach: "multi_objective"
+    sampler: "tpe"
+    nTrials: 10
+    objectives:
+      - metric: "output_tokens_per_second"
+        direction: "maximize"
+      - metric: "time_to_first_token_ms"
+        direction: "minimize"
+        percentile: "p50"
+  testSuite:
+    - name: "perf-eval"
+      type: "concurrency"
+      timeoutSeconds: 60
+      params:
+        concurrency: 4
+        requestCount: 10
+        streaming: true
+        ignoreEOS: true
+        isl: { mean: 64 }
+        osl: { mean: 32 }
+```
+
+#### 2. 手動/測試執行（Docker 容器 + 原始碼熱掛載）
+在叢集節點上快速驗證 Runner 行為：
+```bash
+sudo docker run --rm --net=host \
+  --entrypoint auto-tune-vllm \
+  -v /etc/rancher/k3s/k3s.yaml:/root/.kube/config:ro \
+  -v /tmp/auto_tune_vllm:/app/auto_tune_vllm:ro \
+  -v /tmp/optuna_studies:/app/optuna_studies \
+  keyword1983/auto-tune-vllm:runner \
+  optimize \
+    --backend afsbox \
+    --tuning-name opt125m-cr-test \
+    --namespace afsbox-tokenfactory \
+    --verbose
+```
+
+#### 3. 雲原生 K8s Job 部署（AFSBox Controller 自動派發）
+在正式環境中，`afsbox-controller` 偵測到含 `spec.optimization` 的 CR 時，會自動建立以下 `batchv1.Job`：
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opt125m-cr-test-tuner
+  namespace: afsbox-tokenfactory
+  labels:
+    afsbox.asus.com/model-tuning: opt125m-cr-test
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 7200
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      serviceAccountName: afsbox-modeltuning-runner
+      containers:
+        - name: tuner
+          image: keyword1983/auto-tune-vllm:runner
+          command:
+            - auto-tune-vllm
+            - optimize
+            - --backend
+            - afsbox
+            - --tuning-name
+            - opt125m-cr-test
+            - --namespace
+            - afsbox-tokenfactory
+            - --max-concurrent-trials
+            - "1"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+```
+
+#### 4. CR Status 即時回寫規格
+調校過程中與完成後，Runner 會自動回寫 CR 的 `status`，包含每組候選的參數、壓測結果與帕雷托前沿：
+```yaml
+status:
+  phase: Completed
+  bestCandidate: trial_0
+  paretoFrontier:
+    - trial_0
+  candidates:
+    - name: baseline_concurrency_4
+      phase: Completed
+      benchmarkRef: opt125m-cr-test-c0
+      variables:
+        batch_size: 32
+        gpu_memory_utilization: 0.8
+      metrics:
+        output_tokens_per_second: "1151.3705"
+        time_to_first_token_ms: "12.4317"
+    - name: trial_1
+      phase: Completed
+      benchmarkRef: opt125m-cr-test-c1
+      variables:
+        batch_size: 32
+        gpu_memory_utilization: 0.75
+      metrics:
+        output_tokens_per_second: "1120.2769"
+        time_to_first_token_ms: "15.9512"
+```
+
+
 
