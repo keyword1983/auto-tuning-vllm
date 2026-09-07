@@ -3,15 +3,15 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "auto-tune-vllm"
+name = "auto-tune-serving"
 version = "0.1.0"
-description = "Distributed hyperparameter optimization framework for vLLM serving"
+description = "Distributed hyperparameter optimization framework for LLM serving engines (vLLM, SGLang, llama.cpp)"
 readme = "README.md"
 license = {file = "LICENSE"}
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
-keywords = ["vllm", "optimization", "llm", "serving", "benchmarking", "ray"]
+keywords = ["llm", "serving", "optimization", "vllm", "sglang", "llama-cpp", "benchmarking", "optuna", "ray"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -61,16 +61,17 @@ viz = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/openshift-psap/auto-tuning-vllm"
-Repository = "https://github.com/openshift-psap/auto-tuning-vllm"
-Issues = "https://github.com/openshift-psap/auto-tuning-vllm/issues"
+Homepage = "https://github.com/ocisd4/auto-tune-serving"
+Repository = "https://github.com/ocisd4/auto-tune-serving"
+Issues = "https://github.com/ocisd4/auto-tune-serving/issues"
 
 [project.scripts]
+auto-tune-serving = "auto_tune_vllm.cli:main"
 auto-tune-vllm = "auto_tune_vllm.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["auto_tune_vllm*"]
+include = ["auto_tune_vllm*", "auto_tune_serving*"]
 
 [tool.ruff]
 line-length = 88

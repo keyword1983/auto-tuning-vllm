@@ -25,8 +25,8 @@ from ..logging.manager import CentralizedLogger, LogStreamer
 # Setup rich console and app
 console = Console()
 app = typer.Typer(
-    name="auto-tune-vllm",
-    help="Distributed hyperparameter optimization for vLLM serving",
+    name="auto-tune-serving",
+    help="Distributed hyperparameter optimization for LLM serving engines (vLLM, SGLang, llama.cpp)",
     add_completion=False,
 )
 
@@ -197,7 +197,7 @@ def optimize_command(
             console.print("Choose one of: --python-executable, --venv-path, or --conda-env")
             raise typer.Exit(1)
 
-    console.print("[bold green]Starting auto-tune-vllm optimization[/bold green]")
+    console.print("[bold green]Starting auto-tune-serving optimization[/bold green]")
     console.print(f"Configuration: {config}")
     console.print(f"Backend: {backend}")
 
@@ -1452,21 +1452,22 @@ def main():
     # Handle no arguments case
     if len(sys.argv) == 1:
         console.print(
-            "[bold]auto-tune-vllm[/bold] - Distributed vLLM hyperparameter optimization"
+            "[bold]auto-tune-serving[/bold] - Distributed LLM serving hyperparameter optimization"
         )
         console.print("\nUse --help for available commands")
         console.print("\nQuick start:")
-        console.print("  auto-tune-vllm optimize --config study.yaml")
+        console.print("  auto-tune-serving optimize --config study.yaml")
         console.print(
-            "  auto-tune-vllm logs --study-name my_study --database-url postgresql://..."
+            "  auto-tune-serving logs --study-name my_study --database-url postgresql://..."
         )
         console.print(
-            "  auto-tune-vllm logs --study-name my_study --log-path /path/to/logs"
+            "  auto-tune-serving logs --study-name my_study --log-path /path/to/logs"
         )
-        console.print("  auto-tune-vllm setup-logging --database-url postgresql://...")
+        console.print("  auto-tune-serving setup-logging --database-url postgresql://...")
         console.print(
-            "  auto-tune-vllm clear-study --study-name my_study --database-url postgresql://..."
+            "  auto-tune-serving clear-study --study-name my_study --database-url postgresql://..."
         )
+        console.print("\n(Note: 'auto-tune-vllm' is retained as an alias for backwards compatibility)")
         sys.exit(0)
 
     app()

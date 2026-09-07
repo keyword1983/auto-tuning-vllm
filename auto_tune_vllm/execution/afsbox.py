@@ -226,7 +226,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
             )
             labels = existing.get("metadata", {}).get("labels", {})
             if (
-                labels.get("app.kubernetes.io/managed-by") == "auto-tuning-vllm"
+                labels.get("app.kubernetes.io/managed-by") in ("auto-tuning-vllm", "auto-tune-serving")
                 or (self.tuning_name and labels.get(LABEL_TUNING) == self.tuning_name)
             ):
                 self._serving_created_by_us = True
@@ -348,7 +348,7 @@ class AFSBoxK8sBackend(ExecutionBackend):
                 "name": serving_name,
                 "namespace": self.namespace,
                 "labels": {
-                    "app.kubernetes.io/managed-by": "auto-tuning-vllm",
+                    "app.kubernetes.io/managed-by": "auto-tune-serving",
                 },
             },
             "spec": serving_spec,

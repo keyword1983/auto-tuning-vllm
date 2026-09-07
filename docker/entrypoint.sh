@@ -11,14 +11,14 @@
 set -euo pipefail
 
 if [ "$#" -ne 0 ]; then
-    exec auto-tune-vllm "$@"
+    exec auto-tune-serving "$@"
 elif [ -z "${TUNE_MODEL:-}" ]; then
-    exec auto-tune-vllm --help
+    exec auto-tune-serving --help
 else
     CONFIG_PATH="${TUNE_CONFIG_OUTPUT:-/tmp/generated_study_config.yaml}"
     python3 /opt/auto-tune-vllm/docker/generate_config.py "$CONFIG_PATH"
 
-    auto-tune-vllm validate --config "$CONFIG_PATH"
+    auto-tune-serving validate --config "$CONFIG_PATH"
 
     CREATE_DB_FLAG=()
     if [ -n "${TUNE_DATABASE_URL:-}" ]; then
@@ -28,7 +28,7 @@ else
         CREATE_DB_FLAG=(--create-db)
     fi
 
-    exec auto-tune-vllm optimize \
+    exec auto-tune-serving optimize \
         --config "$CONFIG_PATH" \
         --backend "${TUNE_BACKEND:-ray}" \
         --start-ray-head \

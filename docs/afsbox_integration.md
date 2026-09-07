@@ -1,4 +1,4 @@
-# AFSBox × auto-tuning-vllm (Optuna) 超參數自動調校整合設計與規劃
+# AFSBox × auto-tune-serving (Optuna) 超參數自動調校整合設計與規劃
 
 ## 一、架構背景與設計理念
 
@@ -9,7 +9,7 @@ AFSBox 現有的推論調校功能（`ModelTuning`）採用靜態網格搜尋（
 - **難以權衡多目標**：Throughput（每秒吞吐）與 TTFT（首字延遲）通常互斥，使用者缺乏直觀的 Pareto 前沿決策依據。
 
 ### 1.2 整合目標
-引進 [`auto-tuning-vllm`](https://github.com/openshift-psap/auto-tuning-vllm) 的 Optuna 核心，實現：
+引進 [`auto-tune-serving`](https://github.com/ocisd4/auto-tune-serving)（原 `auto-tuning-vllm` 演進）的 Optuna 核心，實現：
 1. **自適應學習**：使用 TPE（貝氏最佳化）與 NSGA-II（多目標基因演算法），以 15~30 次 Trial 快速收斂至最佳參數區域。
 2. **多目標 Pareto 前沿**：同時最佳化 Throughput（最大化）與 TTFT P95（最小化），產出帕雷托前沿解集。
 3. **無效參數剪枝（Pruning）**：提前攔截不合規或已失敗的參數組合，零浪費 GPU 算力。
@@ -21,13 +21,13 @@ AFSBox 現有的推論調校功能（`ModelTuning`）採用靜態網格搜尋（
 
 ### 2.1 專案邊界釐清：本專案（Autonomous Runner）vs 另專案（optuna-advisor 微服務）
 
-在 AFSBox 智慧調優體系中，存在兩種不同的技術實現路線。**本專案 (`auto-tuning-vllm`) 採用的是「路線 A：端到端自主調校 Runner」**：
+在 AFSBox 智慧調優體系中，存在兩種不同的技術實現路線。**本專案 (`auto-tune-serving`) 採用的是「路線 A：端到端自主調校 Runner」**：
 
 ```mermaid
 graph TB
-    subgraph RouteA["【路線 A：本專案 auto-tune-vllm】端到端自主 Runner（Autonomous Driver）"]
+    subgraph RouteA["【路線 A：本專案 auto-tune-serving】端到端自主 Runner（Autonomous Driver）"]
         direction TB
-        JobA["Tuner Runner Job<br/>(auto-tune-vllm:runner)"]
+        JobA["Tuner Runner Job<br/>(auto-tune-serving:runner)"]
         OptunaA["內建 Optuna 最佳化引擎<br/>(TPE / NSGA-II)"]
         BackendA["內建 AFSBoxK8sBackend<br/>(直接驅動 K8s 調校迴圈)"]
         K8sA["K8s APIServer<br/>(ModelServing / Benchmark / Status)"]
@@ -51,10 +51,10 @@ graph TB
     end
 ```
 
-| 比較維度 | 路線 A：本專案 (`auto-tuning-vllm`) | 路線 B：另一個專案 (`optuna-advisor`) |
+| 比較維度 | 路線 A：本專案 (`auto-tune-serving`) | 路線 B：另一個專案 (`optuna-advisor`) |
 | :--- | :--- | :--- |
 | **角色定位** | **端到端自主調校執行器（Autonomous Tuner Runner）** | **純 HPO 顧問微服務（HTTP REST Advisor Service）** |
-| **所在儲存庫** | `ai-workspace/auto-tuning-vllm` | `afsbox/optuna-advisor` |
+| **所在儲存庫** | `ocisd4/auto-tune-serving` (原 `auto-tuning-vllm`) | `afsbox/optuna-advisor` |
 | **調校迴圈主導者** | **Runner 自己主導**（讀 CR、改 Serving、建 Benchmark、寫 Status） | **`afsbox-controller` 主導**（Controller 逐輪呼叫 Advisor API） |
 | **K8s API 依賴** | Runner 具備 K8s Client，直接與 APIServer 互動 | Advisor 完全不接觸 K8s，純吃 JSON / 吐 JSON |
 | **部署型態** | 隨需啟動的 **`batchv1.Job` / 容器**（跑完自動釋放資源） | 常駐叢集的 **HTTP 微服務**（ClusterIP:8000） |
@@ -63,7 +63,7 @@ graph TB
 
 ### 2.2 本專案系統層級與組件架構圖（含 --tuning-name 與 --config 雙軌讀取路徑）
 
-在目前分支中，`auto-tune-vllm` 同時支援 **本機 YAML 設定檔讀取（`--config`）** 與 **Kubernetes CR 動態合成（`--tuning-name`）** 兩條明確的輸入路徑：
+在目前分支中，`auto-tune-serving` 同時支援 **本機 YAML 設定檔讀取（`--config`）** 與 **Kubernetes CR 動態合成（`--tuning-name`）** 兩條明確的輸入路徑：
 
 ```mermaid
 graph TB
@@ -73,7 +73,7 @@ graph TB
         LocalFile["本機 YAML 設定檔<br/>(study_config.yaml)"]
     end
 
-    subgraph TunerRunner["auto-tune-vllm : Runner 容器內部組件"]
+    subgraph TunerRunner["auto-tune-serving : Runner 容器內部組件"]
         CLI["CLI 進入點 (main.py)<br/>optimize --backend afsbox"]
         Parser["YAML 解析器 (config.py)<br/>解析 parameters / objectives"]
         Synthesizer["CR 配置合成器 (afsbox.py)<br/>synthesize_study_config_from_cr()"]
