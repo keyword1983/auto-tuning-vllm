@@ -17,9 +17,54 @@ AFSBox 現有的推論調校功能（`ModelTuning`）採用靜態網格搜尋（
 
 ---
 
-## 二、角色職責分工（Architecture & Roles）
+## 二、角色職責分工與 Backend 支援設計（Architecture & Backend Design）
 
 採用**「方案 C：AFSBox 原生驅動 + auto-tune-vllm 演算法大腦」**模式：
+
+### 2.1 系統層級與組件支援架構圖
+
+```mermaid
+graph TB
+    subgraph Tuner["auto-tune-vllm (Tuner Runner 核心)"]
+        CLI["CLI Command (main.py)<br/>optimize --backend afsbox"]
+        Controller["StudyController (Optuna Engine)<br/>MOTPE / NSGA-II 演算法搜尋"]
+        Backend["AFSBoxK8sBackend (afsbox.py)<br/>實作 ExecutionBackend 抽象介面"]
+        Synthesizer["CR Config Synthesizer<br/>從 ModelTuning 自動合成配置"]
+        K8sClient["Kubernetes Python SDK<br/>CustomObjectsApi"]
+    end
+
+    subgraph K8sAPI["Kubernetes APIServer & Custom Resources"]
+        CR_Tuning["ModelTuning CR<br/>afsbox.asus.com/v1beta1<br/>(最佳化目標、演算法、壓測規格)"]
+        CR_Serving["ModelServing CR<br/>&lt;tuning&gt;-exp<br/>(推論模型、GPU、引擎參數)"]
+        CR_Bench["Benchmark CR<br/>&lt;tuning&gt;-cN<br/>(AIPerf 並發負載規格)"]
+        CR_Report["BenchmarkReport CR<br/>&lt;tuning&gt;-cN<br/>(Throughput、TTFT 指標)"]
+    end
+
+    subgraph AFSBoxInfra["AFSBox 控制面與資料面"]
+        AFS_Controller["afsbox-controller<br/>(ModelServingReconciler / Operator)"]
+        LLM_Pod["推論引擎 Pod (GPU Claim)<br/>vLLM / SGLang / llama.cpp"]
+        Bench_Job["AIPerf Benchmark Job<br/>(高並發流量發送器)"]
+    end
+
+    CLI -->|"--tuning-name"| Synthesizer
+    Synthesizer -->|"1. 讀取 CR 規格"| CR_Tuning
+    CLI --> Controller
+    Controller -->|"ask() / tell()"| Backend
+    Backend --> K8sClient
+    K8sClient -->|"2. 建立與 Patch 候選參數"| CR_Serving
+    K8sClient -->|"3. 建立壓測請求"| CR_Bench
+    K8sClient -->|"4. 輪詢萃取指標"| CR_Report
+    K8sClient -->|"5. 回寫 candidates/variables/metrics"| CR_Tuning
+
+    AFS_Controller -->|"Watch & Reconcile"| CR_Serving
+    AFS_Controller -->|"調度 GPU & 掛載權重"| LLM_Pod
+    AFS_Controller -->|"Watch & 執行"| CR_Bench
+    AFS_Controller -->|"啟動壓測容器"| Bench_Job
+    Bench_Job -->|"HTTP /v1/chat/completions"| LLM_Pod
+    Bench_Job -->|"寫入量測成績"| CR_Report
+```
+
+### 2.2 核心角色矩陣
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -47,45 +92,63 @@ AFSBox 現有的推論調校功能（`ModelTuning`）採用靜態網格搜尋（
 
 ---
 
-## 三、端到端數據流向時序圖（End-to-End Sequence）
+## 三、與 AFSBox 互動溝通與完整生命週期時序圖（Communication & Lifecycle Sequence）
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as 使用者
-    participant Portal as afsbox-portal
-    participant Platform as afsbox-platform
-    participant Controller as afsbox-controller
-    participant Tuner as Tuner Pod (auto-tune-vllm)
-    participant Serving as 實驗 ModelServing (LWS / GPU)
-    participant Bench as Benchmark Job (AIPerf)
+    participant User as 使用者 / Portal
+    participant Runner as auto-tune-vllm Runner
+    participant K8s as Kubernetes APIServer
+    participant Ctrl as afsbox-controller
+    participant Serving as 實驗 Serving Pod (vLLM)
+    participant Bench as 壓測 Pod (AIPerf)
 
-    User->>Portal: 選擇模型，設定搜尋空間與目標 (Throughput, TTFT)
-    User->>Portal: 點擊「開始智慧調校」
-    Portal->>Platform: POST /api/v1/benchmark-templates/apply
-    Platform->>Controller: 建立 ModelTuning CR (engine: "optuna")
-    Controller->>Serving: 建立 <tuning>-exp 實驗 Serving
-    Controller->>Tuner: 啟動 Tuner Runner Job (auto-tune-vllm:runner)
-    
-    loop 每一輪 Optuna Trial (共 n_trials 次)
-        Tuner->>Tuner: Optuna.ask() 採樣超參數組合
-        Tuner->>Tuner: 檢查約束 (Constraint check)，違規則 prune
-        Tuner->>Serving: Patch 候選參數 (tp, batchSize, memUtil, nodes...)
-        Serving-->>Tuner: 等候 Multi-Node LWS Rollout 且 Status.Phase == Ready
-        Tuner->>Controller: 建立子 Benchmark CR (<tuning>-trial-N)
-        Controller->>Bench: 啟動 AIPerf Job 發送並發流量
-        Bench-->>Controller: 輸出效能 summary (TTFT, Throughput, ITL)
-        Controller-->>Tuner: 讀取 Benchmark.Status.Results
-        Tuner->>Tuner: Optuna.tell(values=[throughput, ttft]) 更新後驗模型
-        Tuner->>Controller: 即時同步 Status.Candidates 與 CurrentCandidate
+    Note over User, Ctrl: 階段 1：任務發起與配置合成
+    User->>K8s: 建立 ModelTuning CR (spec.optimization, testSuite, servingTemplate)
+    Runner->>K8s: GET ModelTuning CR (--tuning-name)
+    K8s-->>Runner: 回傳 CR 規格
+    Runner->>Runner: 自動合成 Optuna 搜尋空間 (batchSize, memUtil) 與 Baseline 設定
+
+    Note over Runner, Serving: 階段 2：實驗 Serving 建立與 Ready 判定
+    Runner->>K8s: POST ModelServing (<name>-exp, generation=1)
+    Ctrl->>K8s: Watch 偵測到新 ModelServing
+    Ctrl->>Serving: 渲染 Helm Chart、排程 GPU、啟動 vLLM 容器
+    loop 每 5 秒輪詢 Serving 就緒狀態
+        Runner->>K8s: GET ModelServing (<name>-exp)
+        K8s-->>Runner: status.phase=Progressing
+    end
+    Serving-->>Ctrl: 權重加載完畢，Health Probe 200 OK
+    Ctrl->>K8s: PATCH ModelServing status.phase=Ready, observedGeneration=1
+    Runner->>K8s: GET ModelServing -> Ready! 進入調校迴圈
+
+    Note over Runner, Bench: 階段 3：Trial 迴圈 (0 .. N-1 輪)
+    loop 每一輪 Optuna Trial (Baseline 及後續建議)
+        Runner->>Runner: Optuna.ask() 採樣超參數組合
+        Runner->>K8s: PATCH ModelServing (<name>-exp) 套用新參數 [targetGen=G+1]
+        Ctrl->>Serving: 重啟 / 更新推論容器
+        loop 等候 Rollout 就緒 (防競態等候)
+            Runner->>K8s: GET ModelServing
+            Note over Runner: 檢查 observedGen >= G+1 且 phase == Ready
+        end
+        Runner->>K8s: POST Benchmark CR (<name>-c{N})
+        Runner->>K8s: PATCH ModelTuning.status (Candidate={N}, phase=Testing, variables=params)
+        Ctrl->>Bench: 啟動 AIPerf Job 容器
+        Bench->>Serving: 內網發送並發流量 (HTTP /v1/chat/completions)
+        Bench-->>Ctrl: 壓測完成，產出 Summary JSON
+        Ctrl->>K8s: 建立同名 BenchmarkReport CR (<name>-c{N})
+        Runner->>K8s: GET BenchmarkReport (<name>-c{N})
+        K8s-->>Runner: 回傳 Throughput 與 TTFT 數據
+        Runner->>Runner: Optuna.tell() 吸收指標，更新貝氏機率模型
+        Runner->>K8s: PATCH ModelTuning.status (Candidate={N}, phase=Completed, metrics=..., variables=...)
     end
 
-    Tuner->>Controller: 將最優解與 Pareto 前沿寫入 ModelTuning.Status
-    Controller->>Serving: 刪除實驗 Serving (徹底釋放 GPU 算力)
-    Controller->>Tuner: 標記 ModelTuning 為 Completed
-    User->>Portal: 查看 ModelTuningReport (Pareto 散佈圖)
-    User->>Portal: 點擊最優點「用這組參數部署」
-    Portal->>Platform: 填入最佳參數建立生產 ModelServing！
+    Note over Runner, Ctrl: 階段 4：最優解彙整與資源清理
+    Runner->>Runner: 評估 Pareto Frontier 與 Best Candidate
+    Runner->>K8s: PATCH ModelTuning.status (bestCandidate, paretoFrontier)
+    Runner->>K8s: DELETE ModelServing (<name>-exp)
+    Ctrl->>Serving: 刪除 Serving Pod，徹底釋放實體 GPU 算力！
+    User->>K8s: 查看 ModelTuning.status 取得完整調優報告
 ```
 
 ---
@@ -406,7 +469,25 @@ controllerManager:
 
 `auto-tune-vllm` 提供兩種核心執行模式，分別針對 **「本機研發與自訂調優」** 與 **「雲原生 Portal / CR 整合調優」**：
 
-### 13.1 模式比較矩陣
+### 13.1 模式比較與運行拓撲
+
+```mermaid
+graph LR
+    subgraph Mode1["模式一：CLI 模式（獨立 Config 驅動）"]
+        direction TB
+        LocalConfig["study_config.yaml<br/>(本機指定演算法/目標/參數)"] --> Runner1["auto-tune-vllm<br/>CLI Runner 容器"]
+        Runner1 -->|"直連 Patch / 壓測"| Serving1["ModelServing<br/>(optuna-tune-exp)"]
+        Runner1 -->|"輸出日誌與指標"| DB1["SQLite<br/>(study.db)"]
+    end
+
+    subgraph Mode2["模式二：CR 驅動模式（Portal / 雲原生整合）"]
+        direction TB
+        Portal["AFSBox Portal UI<br/>(精靈建立)"] -->|"Apply CR"| CR["ModelTuning CR<br/>(opt125m-cr-test)"]
+        CR -->|"委派 Job / 讀取規格"| Runner2["auto-tune-vllm<br/>Runner Pod"]
+        Runner2 -->|"自動拉起與刪除"| Serving2["ModelServing<br/>(opt125m-cr-test-exp)"]
+        Runner2 -->|"即時回寫 variables/metrics"| CR
+    end
+```
 
 | 比較維度 | 模式一：CLI 模式（獨立 Config 驅動） | 模式二：CR 驅動模式（ModelTuning CR 整合） |
 | :--- | :--- | :--- |
